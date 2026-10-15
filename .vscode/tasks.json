@@ -1,0 +1,34 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Decky: Install dependencies",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/decky-dev.sh",
+      "args": ["install"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Decky: Build",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/decky-dev.sh",
+      "args": ["build"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Decky: Test",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/decky-dev.sh",
+      "args": ["test"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Decky: Package test ZIP",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/decky-dev.sh",
+      "args": ["package"],
+      "problemMatcher": []
+    }
+  ]
+}

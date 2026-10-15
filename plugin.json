@@ -1,0 +1,10 @@
+{
+  "name": "Proton VPN",
+  "author": "acestronautical",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["vpn", "protonvpn", "utility"],
+    "description": "Check and toggle Proton VPN connections from Gaming Mode."
+  }
+}
