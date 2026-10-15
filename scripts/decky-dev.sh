@@ -71,8 +71,7 @@ case "$command_name" in
     run_pnpm install --frozen-lockfile
     ;;
   test)
-    cd "$ROOT_DIR"
-    python3 -m unittest discover -s tests
+    run_pnpm run test
     ;;
   build)
     run_pnpm run build

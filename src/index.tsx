@@ -1,7 +1,15 @@
-import { ButtonItem, Dropdown, PanelSection, PanelSectionRow, staticClasses } from "@decky/ui";
+import {
+  ButtonItem,
+  Dropdown,
+  PanelSection,
+  PanelSectionRow,
+  TextField,
+  staticClasses,
+} from "@decky/ui";
 import { callable, definePlugin, toaster } from "@decky/api";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FaShieldAlt } from "react-icons/fa";
+import { encodeSignIn, encryptSignIn } from "./signin";
 
 type ProtonCountry = {
   code: string;
@@ -9,12 +17,14 @@ type ProtonCountry = {
 };
 
 type ProtonStatus = {
-  installed: boolean;
-  signed_in: boolean;
-  connected: boolean;
+  installed: boolean | null;
+  signed_in: boolean | null;
+  connected: boolean | null;
   server?: string;
   protocol?: string;
   error?: string;
+  diagnostics?: Record<string, string>;
+  can_start_keyring?: boolean;
 };
 
 type CountryList = {
@@ -23,8 +33,22 @@ type CountryList = {
   error?: string;
 };
 
+type SignInSession = {
+  session_id: string;
+  public_key: string;
+};
+
+type SignInError = { error: string };
+
 const getStatus = callable<[], ProtonStatus>("get_status");
+const startKeyring = callable<[], ProtonStatus>("start_keyring");
 const getCountries = callable<[], CountryList>("get_countries");
+const beginSignIn = callable<[], SignInSession | SignInError>("begin_signin");
+const cancelSignIn = callable<[sessionId: string], void>("cancel_signin");
+const completeSignIn = callable<
+  [sessionId: string, ciphertext: string],
+  ProtonStatus | SignInError
+>("complete_signin");
 const connectCountry = callable<[countryCode: string], ProtonStatus>(
   "connect_country",
 );
@@ -34,14 +58,23 @@ function Content() {
   const [status, setStatus] = useState<ProtonStatus>();
   const [countries, setCountries] = useState<ProtonCountry[]>([]);
   const [selectedCountry, setSelectedCountry] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [totp, setTotp] = useState("");
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [loadingCountries, setLoadingCountries] = useState(false);
+  const [signingIn, setSigningIn] = useState(false);
+  const mounted = useRef(true);
+  const signInRequest = useRef<{
+    plaintext: Uint8Array;
+    sessionId?: string;
+  } | undefined>(undefined);
 
-  const refreshStatus = async () => {
+  const refreshStatus = async (action = getStatus) => {
     setBusy(true);
     try {
-      const result = await getStatus();
+      const result = await action();
       setStatus(result);
       setError(result.error);
     } catch (reason) {
@@ -50,6 +83,18 @@ function Content() {
       setBusy(false);
     }
   };
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      const request = signInRequest.current;
+      request?.plaintext.fill(0);
+      if (request?.sessionId) {
+        void cancelSignIn(request.sessionId).catch(() => {});
+      }
+    };
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -75,6 +120,7 @@ function Content() {
     if (!status?.signed_in || status.error) {
       setCountries([]);
       setSelectedCountry("");
+      setLoadingCountries(false);
       return;
     }
 
@@ -117,13 +163,75 @@ function Content() {
       const result = await action();
       setStatus(result);
       setError(result.error);
-      toaster.toast({ title: "Proton VPN", body: success });
+      toaster.toast({ title: "Proton VPN", body: result.error ?? success });
     } catch (reason) {
       const message = String(reason);
       setError(message);
       toaster.toast({ title: "Proton VPN", body: message });
     } finally {
       setBusy(false);
+    }
+  };
+
+  const submitSignIn = async () => {
+    if (signInRequest.current || busy) {
+      return;
+    }
+    setSigningIn(true);
+    setError(undefined);
+    try {
+      if (!globalThis.crypto?.subtle) {
+        throw new Error("Secure sign-in is unavailable here; use Desktop Mode sign-in");
+      }
+      const request: { plaintext: Uint8Array; sessionId?: string } = {
+        plaintext: encodeSignIn({ username, password, totp }),
+      };
+      signInRequest.current = request;
+      setPassword("");
+      setTotp("");
+      const session = await beginSignIn();
+      if ("error" in session) {
+        throw new Error(session.error);
+      }
+      request.sessionId = session.session_id;
+      if (!mounted.current) {
+        return;
+      }
+      const ciphertext = await encryptSignIn(session.public_key, request.plaintext);
+      if (!mounted.current) {
+        return;
+      }
+      const result = await completeSignIn(session.session_id, ciphertext);
+      if (!mounted.current) {
+        return;
+      }
+      if (!("installed" in result)) {
+        throw new Error(result.error);
+      }
+      setStatus(result);
+      setError(result.error);
+      if (result.signed_in) {
+        setUsername("");
+        toaster.toast({ title: "Proton VPN", body: result.error ?? "Signed in" });
+      }
+    } catch (reason) {
+      if (mounted.current) {
+        const message = String(reason);
+        setError(message);
+        toaster.toast({ title: "Proton VPN", body: message });
+      }
+    } finally {
+      const request = signInRequest.current;
+      request?.plaintext.fill(0);
+      if (request?.sessionId) {
+        void cancelSignIn(request.sessionId).catch(() => {});
+      }
+      signInRequest.current = undefined;
+      if (mounted.current) {
+        setPassword("");
+        setTotp("");
+        setSigningIn(false);
+      }
     }
   };
 
@@ -136,10 +244,10 @@ function Content() {
           <div>
             {!status
               ? "Checking Proton VPN CLI..."
-              : !status.installed
-                ? "Proton VPN is not installed. Install it from Discover in Desktop Mode."
-                : status.error
-                  ? "Proton VPN CLI is unavailable"
+              : status.error
+                ? "Proton VPN status is unavailable"
+                : !status.installed
+                  ? "Proton VPN is not installed. Install it from Discover in Desktop Mode."
                   : !status.signed_in
                     ? "Proton VPN CLI is signed out"
                     : status.connected
@@ -157,27 +265,70 @@ function Content() {
             <div>{error}</div>
           </PanelSectionRow>
         )}
+        {status?.can_start_keyring && (
+          <PanelSectionRow>
+            <ButtonItem disabled={busy || signingIn} onClick={() => void refreshStatus(startKeyring)}>
+              Start existing keyring service
+            </ButtonItem>
+          </PanelSectionRow>
+        )}
+        {status?.diagnostics && (
+          <PanelSectionRow>
+            <div style={{ fontSize: 12, overflowWrap: "anywhere" }}>
+              {Object.entries(status.diagnostics).map(([label, value]) => (
+                <div key={label}>{label}: {value}</div>
+              ))}
+            </div>
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
-          <ButtonItem disabled={busy} onClick={() => void refreshStatus()}>
+          <ButtonItem disabled={busy || signingIn} onClick={() => void refreshStatus()}>
             Refresh Proton VPN status
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
 
-      {status?.installed && !status.signed_in && !status.error && (
+      {status?.installed && status.signed_in === false && !status.error && (
         <PanelSection title="Sign in">
           <PanelSectionRow>
-            <div>
-              Close the Proton VPN desktop app. In Desktop Mode, open Konsole and run:
-            </div>
+            <TextField
+              label="Proton username"
+              value={username}
+              disabled={signingIn}
+              onChange={(event) => setUsername(event.currentTarget.value)}
+            />
           </PanelSectionRow>
           <PanelSectionRow>
-            <code>flatpak run --command=protonvpn com.protonvpn.www signin &lt;username&gt;</code>
+            <TextField
+              label="Password"
+              {...{ type: "password", autoComplete: "off" }}
+              value={password}
+              bIsPassword
+              bShowCopyAction={false}
+              spellCheck={false}
+              disabled={signingIn}
+              onChange={(event) => setPassword(event.currentTarget.value)}
+            />
           </PanelSectionRow>
           <PanelSectionRow>
-            <div>
-              Enter your password and any verification only in Proton CLI's terminal prompts. Decky never receives or stores them.
-            </div>
+            <TextField
+              label="Authenticator or recovery code (if required)"
+              {...{ type: "password", autoComplete: "off" }}
+              value={totp}
+              bIsPassword
+              bShowCopyAction={false}
+              spellCheck={false}
+              disabled={signingIn}
+              onChange={(event) => setTotp(event.currentTarget.value)}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem
+              disabled={busy || signingIn || !username || !password}
+              onClick={() => void submitSignIn()}
+            >
+              {signingIn ? "Signing in..." : "Sign in"}
+            </ButtonItem>
           </PanelSectionRow>
         </PanelSection>
       )}

@@ -6,7 +6,7 @@
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
-    "test": "python3 -m unittest discover -s tests"
+    "test": "python3 -m unittest discover -s tests && node --test tests/test_signin.mjs"
   },
   "repository": {
     "type": "git",
