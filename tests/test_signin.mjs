@@ -18,6 +18,7 @@ const bridge = `
 import base64, json, os, sys, tempfile, types
 from unittest.mock import patch
 sys.modules.setdefault("decky", types.ModuleType("decky"))
+sys.path.insert(0, os.path.abspath("py_modules"))
 import main
 request = json.load(sys.stdin)
 if request["action"] == "keypair":

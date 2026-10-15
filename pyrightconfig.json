@@ -1,0 +1,4 @@
+{
+  "extraPaths": ["py_modules"],
+  "pythonVersion": "3.10"
+}

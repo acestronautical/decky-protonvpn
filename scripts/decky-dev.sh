@@ -54,6 +54,8 @@ package_plugin() {
   mkdir -p "$output_dir" "$staging_dir/Proton VPN/dist"
   cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/main.py" "$ROOT_DIR/package.json" \
     "$ROOT_DIR/plugin.json" "$ROOT_DIR/README.md" "$staging_dir/Proton VPN/"
+  mkdir -p "$staging_dir/Proton VPN/py_modules/protonvpn"
+  cp "$ROOT_DIR"/py_modules/protonvpn/*.py "$staging_dir/Proton VPN/py_modules/protonvpn/"
   cp -a "$ROOT_DIR/dist/." "$staging_dir/Proton VPN/dist/"
   rm -f "$archive"
   (cd "$staging_dir" && zip -qr "$archive" "Proton VPN")

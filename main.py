@@ -1,96 +1,23 @@
 import asyncio
 import base64
+import binascii
 import json
-import os
 import re
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 import uuid
 
 import decky
+from protonvpn import keyring, proton_cli
 
 
-FLATPAK = "/usr/bin/flatpak"
-BUSCTL = "/usr/bin/busctl"
-PROTON_APP_ID = "com.protonvpn.www"
-PROTON_CLI_COMMAND = [
-    FLATPAK,
-    "run",
-    "--command=protonvpn",
-    PROTON_APP_ID,
-]
-CLI_TIMEOUT_SECONDS = 90
 SIGNIN_TIMEOUT_SECONDS = 180
 SIGNIN_SESSION_TTL_SECONDS = 300
 SIGNIN_SESSIONS: dict[str, tuple[bytearray, float]] = {}
 SIGNIN_SESSIONS_LOCK = threading.Lock()
 CLI_OPERATION_LOCK = threading.Lock()
-
-KEYRING_PROBE_CODE = """
-import json
-from contextlib import closing
-from importlib import metadata
-
-report = {}
-try:
-    entries = metadata.entry_points(group="proton_loader_keyring")
-    report["drivers"] = sorted({entry.name if entry.name in ("secret_service", "libsecret", "json") else "other" for entry in entries})
-    for field, package in (("cli_version", "proton-vpn-cli"), ("keyring_version", "proton-keyring-linux")):
-        try:
-            report[field] = metadata.version(package)
-        except metadata.PackageNotFoundError:
-            pass
-except Exception:
-    pass
-try:
-    import secretstorage
-    from jeepney.bus_messages import message_bus
-    from jeepney.io.blocking import Proxy
-except ImportError:
-    report["probe"] = "dependencies missing"
-else:
-    try:
-        connection = secretstorage.dbus_init()
-    except Exception:
-        report["bus"] = "unreachable"
-    else:
-        report["bus"] = "reachable"
-        with closing(connection):
-            try:
-                bus = Proxy(message_bus, connection)
-                names = set(bus.ListNames()[0])
-                if "org.freedesktop.secrets" not in names:
-                    available = bus.ListActivatableNames()[0]
-                    report["service"] = "inactive" if "org.freedesktop.secrets" in available else "absent"
-                else:
-                    report["service"] = "running"
-                    report["provider"] = "other"
-                    owner = bus.GetNameOwner("org.freedesktop.secrets")[0]
-                    for name, provider in (
-                        ("org.kde.kwalletd6", "KWallet"),
-                        ("org.kde.kwalletd5", "KWallet"),
-                        ("org.gnome.keyring", "GNOME Keyring"),
-                    ):
-                        if name in names and bus.GetNameOwner(name)[0] == owner:
-                            report["provider"] = provider
-                            break
-                    try:
-                        collection = secretstorage.Collection(connection)
-                        report["collection"] = "locked" if collection.is_locked() else "unlocked"
-                    except secretstorage.ItemNotFoundException:
-                        report["collection"] = "missing"
-                    except secretstorage.SecretServiceNotAvailableException:
-                        report["collection"] = "unavailable"
-                    except Exception:
-                        report["collection"] = "check failed"
-            except Exception:
-                report["service"] = "check failed"
-print(json.dumps(report))
-"""
-
 
 def _clear_signin_sessions(expired_only: bool = False) -> None:
     with SIGNIN_SESSIONS_LOCK:
@@ -140,7 +67,7 @@ def _generate_signin_keypair() -> tuple[bytearray, str]:
         check=False,
         stdin=subprocess.DEVNULL,
         timeout=30,
-        env=_cli_environment(),
+        env=proton_cli.cli_environment(),
     )
     if private_result.returncode != 0:
         raise RuntimeError("Could not start a secure sign-in session")
@@ -151,7 +78,7 @@ def _generate_signin_keypair() -> tuple[bytearray, str]:
         check=False,
         input=private_result.stdout,
         timeout=10,
-        env=_cli_environment(),
+        env=proton_cli.cli_environment(),
     )
     if public_result.returncode != 0:
         raise RuntimeError("Could not start a secure sign-in session")
@@ -159,7 +86,7 @@ def _generate_signin_keypair() -> tuple[bytearray, str]:
 
 
 def _begin_signin() -> dict[str, str]:
-    if not _flatpak_installed():
+    if not proton_cli.flatpak_installed():
         raise RuntimeError("Install Proton VPN from Discover in Desktop Mode first")
 
     if not SIGNIN_SESSIONS_LOCK.acquire(blocking=False):
@@ -195,7 +122,7 @@ def _decrypt_signin_payload(private_key: bytearray, ciphertext: str) -> dict[str
         raise ValueError("Invalid sign-in request")
     try:
         encrypted = base64.b64decode(ciphertext, validate=True)
-    except (ValueError, base64.binascii.Error) as error:
+    except (ValueError, binascii.Error) as error:
         raise ValueError("Invalid sign-in request") from error
     if len(encrypted) != 512:
         raise ValueError("Invalid sign-in request")
@@ -226,7 +153,7 @@ def _decrypt_signin_payload(private_key: bytearray, ciphertext: str) -> dict[str
                 check=False,
                 timeout=10,
                 pass_fds=(key_file.fileno(),),
-                env=_cli_environment(),
+                env=proton_cli.cli_environment(),
             )
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("Secure sign-in could not be completed") from None
@@ -258,13 +185,13 @@ def _run_cli_signin(credentials: dict[str, str]) -> dict:
 
     try:
         result = subprocess.run(
-            [*PROTON_CLI_COMMAND, "signin", "--totp", "--", username],
+            [*proton_cli.PROTON_CLI_COMMAND, "signin", "--totp", "--", username],
             input=f"{password}\n{totp}\n",
             capture_output=True,
             check=False,
             text=True,
             timeout=SIGNIN_TIMEOUT_SECONDS,
-            env=_cli_environment(),
+            env=proton_cli.cli_environment(),
             start_new_session=True,
         )
     except subprocess.TimeoutExpired:
@@ -312,343 +239,29 @@ def _complete_signin(session_id: str, ciphertext: str) -> dict:
         private_key[:] = b"\0" * len(private_key)
 
 
-def _cli_environment() -> dict[str, str]:
-    environment = os.environ.copy()
-    if getattr(sys, "frozen", False):
-        original_library_path = environment.pop("LD_LIBRARY_PATH_ORIG", None)
-        if original_library_path:
-            environment["LD_LIBRARY_PATH"] = original_library_path
-        else:
-            environment.pop("LD_LIBRARY_PATH", None)
-    environment["LC_ALL"] = "C"
-    runtime_dir = environment.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    environment.setdefault(
-        "DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus"
-    )
-    return environment
-
-
-def _command_failure_category(output: str) -> str:
-    output = output.casefold()
-    if any(message in output for message in (
-        "symbol lookup error", "error while loading shared libraries", "version `",
-    )):
-        return "shared-library error"
-    if any(message in output for message in ("keyring", "secretstorage", "secretservice", "secret service", "org.freedesktop.secrets")):
-        if any(message in output for message in ("keyringlocked", "lockedexception", "collection is locked", "keyring is locked")):
-            return "keyring locked"
-        if "dismissed" in output:
-            return "keyring unlock dismissed"
-        if "nokeyringerror" in output or "no recommended backend" in output:
-            return "keyring backend unavailable"
-        if "secretservicenotavailableexception" in output or "serviceunknown" in output:
-            return "Secret Service unavailable"
-        return "keyring error"
-    if "networkmanager" in output or "org.freedesktop.networkmanager" in output:
-        return "NetworkManager error"
-    if "permission denied" in output or "operation not permitted" in output:
-        return "permission denied"
-    if "d-bus" in output or "dbus" in output:
-        return "D-Bus error"
-    if "unknown option" in output or "no such option" in output:
-        return "unsupported option"
-    if "no such command" in output or "unknown action" in output:
-        return "unsupported command"
-    return "unclassified error"
-
-
-def _probe_keyring(environment: dict[str, str]) -> dict[str, str]:
-    try:
-        result = subprocess.run(
-            [FLATPAK, "run", "--command=python3", PROTON_APP_ID, "-c", KEYRING_PROBE_CODE],
-            capture_output=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            timeout=10,
-            env=environment,
-            start_new_session=True,
-        )
-        if result.returncode != 0:
-            return {"probe": "unavailable"}
-        report = json.loads(result.stdout)
-    except subprocess.TimeoutExpired:
-        return {"probe": "timed out"}
-    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
-        return {"probe": "unavailable"}
-    if not isinstance(report, dict):
-        return {"probe": "unavailable"}
-    allowed = {
-        "probe": ("dependencies missing",),
-        "bus": ("reachable", "unreachable"),
-        "service": ("running", "inactive", "absent", "check failed"),
-        "provider": ("KWallet", "GNOME Keyring", "other"),
-        "collection": ("locked", "unlocked", "missing", "unavailable", "check failed"),
-    }
-    filtered = {key: value for key, value in report.items() if key in allowed and value in allowed[key]}
-    drivers = report.get("drivers")
-    if isinstance(drivers, list) and all(driver in ("secret_service", "libsecret", "json", "other") for driver in drivers):
-        filtered["drivers"] = ", ".join(sorted(set(drivers))) or "none"
-    for field in ("cli_version", "keyring_version"):
-        version = report.get(field)
-        if isinstance(version, str) and len(version) <= 32 and re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", version):
-            filtered[field] = version
-    return filtered or {"probe": "unavailable"}
-
-
-def _keyring_diagnostics() -> dict[str, str]:
-    environment = _cli_environment()
-    runtime_dir = f"/run/user/{os.getuid()}"
-    bus_address = f"unix:path={runtime_dir}/bus"
-    canonical = dict(environment, XDG_RUNTIME_DIR=runtime_dir, DBUS_SESSION_BUS_ADDRESS=bus_address)
-    same_bus = all(environment.get(key) == canonical[key] for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"))
-    report = {
-        "User": "root" if os.getuid() == 0 else "non-root",
-        "User bus environment": "standard" if same_bus else "nonstandard",
-        "Display environment": "present" if environment.get("DISPLAY") or environment.get("WAYLAND_DISPLAY") else "absent",
-        "Proton loader override": "set" if environment.get("PROTON_LOADER_OVERRIDES") else "unset",
-        "Snap environment": "present" if "SNAP" in environment else "absent",
-    }
-    labels = {
-        "probe": "Probe", "bus": "Session bus", "service": "Secret Service",
-        "provider": "Service provider", "collection": "Default collection",
-        "drivers": "Registered Proton drivers", "cli_version": "CLI version",
-        "keyring_version": "Proton keyring version",
-    }
-    report.update({labels[key]: value for key, value in _probe_keyring(environment).items()})
-    if not same_bus:
-        report.update({f"Standard bus: {labels[key]}": value for key, value in _probe_keyring(canonical).items()})
-    report.update(_host_keyring_diagnostics())
-    return report
-
-
-def _user_bus_call(method: str, service: str | None = None) -> set[str]:
-    if method not in ("ListNames", "ListActivatableNames", "StartServiceByName"):
-        raise ValueError("Unsupported user-bus operation")
-    command = [
-        BUSCTL, "--user", "--timeout=5", "--json=short", "call",
-        "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", method,
-    ]
-    if method == "StartServiceByName":
-        if service not in (
-            "org.freedesktop.secrets", "org.kde.secretservicecompat",
-            "org.kde.kwalletd6", "org.kde.kwalletd5", "org.gnome.keyring",
-        ):
-            raise ValueError("Unsupported keyring service")
-        command.extend(["su", service, "0"])
-    try:
-        result = subprocess.run(
-            command, capture_output=True, check=False, stdin=subprocess.DEVNULL,
-            text=True, timeout=6, env=_cli_environment(), start_new_session=True,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("User-session keyring service check or activation timed out") from None
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        raise RuntimeError("User-session D-Bus tool is unavailable") from None
-    if result.returncode != 0:
-        output = f"{result.stderr}\n{result.stdout}".casefold()
-        category = next((label for marker, label in (
-            ("serviceunknown", "service not registered"),
-            ("accessdenied", "access denied"),
-            ("permission denied", "access denied"),
-            ("noreply", "service did not respond"),
-            ("timed out", "service timed out"),
-            ("childexited", "service exited during startup"),
-            ("exited with", "service exited during startup"),
-            ("display", "display unavailable"),
-        ) if marker in output), "service operation failed")
-        raise RuntimeError(f"User-session keyring service: {category} (exit {result.returncode})")
-    try:
-        response = json.loads(result.stdout)
-        if not isinstance(response, dict):
-            raise ValueError()
-        data = response.get("data")
-        if not isinstance(data, list) or len(data) != 1:
-            raise ValueError()
-        if method == "StartServiceByName":
-            if response.get("type") != "u" or type(data[0]) is not int or data[0] not in (1, 2):
-                raise ValueError()
-            return set()
-        if response.get("type") != "as" or not isinstance(data[0], list) or not all(isinstance(name, str) for name in data[0]):
-            raise ValueError()
-        return set(data[0])
-    except (ValueError, TypeError):
-        raise RuntimeError("User-session D-Bus returned an invalid response") from None
-
-
-def _select_keyring_service(names: set[str]) -> str | None:
-    if "org.freedesktop.secrets" in names:
-        return "org.freedesktop.secrets"
-    kde_service = next((name for name in (
-        "org.kde.secretservicecompat", "org.kde.kwalletd6", "org.kde.kwalletd5",
-    ) if name in names), None)
-    gnome_service = "org.gnome.keyring" if "org.gnome.keyring" in names else None
-    if kde_service and gnome_service:
-        raise RuntimeError("Multiple keyring providers are available; select the existing provider in Desktop Mode")
-    return kde_service or gnome_service
-
-
-def _host_keyring_diagnostics() -> dict[str, str]:
-    try:
-        names = _user_bus_call("ListNames")
-        if "org.freedesktop.secrets" in names:
-            return {"Host Secret Service": "running", "Keyring service activation": "not needed"}
-        available = _user_bus_call("ListActivatableNames")
-        service = _select_keyring_service(available)
-        provider = {
-            "org.freedesktop.secrets": "Secret Service",
-            "org.kde.secretservicecompat": "KDE Secret Service",
-            "org.kde.kwalletd6": "KWallet 6",
-            "org.kde.kwalletd5": "KWallet 5",
-            "org.gnome.keyring": "GNOME Keyring",
-        }.get(service, "none")
-        return {
-            "Host Secret Service": "absent",
-            "Activatable host provider": provider,
-            "Keyring service activation": "available" if service and os.getuid() != 0 else "unavailable",
-        }
-    except RuntimeError as error:
-        return {"Host keyring check": str(error), "Keyring service activation": "unavailable"}
-
-
 def _start_keyring_service() -> dict:
-    if os.getuid() == 0:
-        return {"installed": None, "signed_in": None, "connected": None, "error": "Keyring activation must run as the Deck user, not root"}
-    failure = None
     try:
-        names = _user_bus_call("ListNames")
-        if "org.freedesktop.secrets" not in names:
-            service = _select_keyring_service(_user_bus_call("ListActivatableNames"))
-            if service is None:
-                raise RuntimeError("No existing keyring provider is registered on the user bus; Desktop Mode keyring setup is required")
-            _user_bus_call("StartServiceByName", service)
+        failure, startup_report = keyring.start_service()
     except RuntimeError as error:
-        failure = str(error)
+        return {"installed": None, "signed_in": None, "connected": None, "error": str(error)}
     result = _get_status()
     if failure:
         result["error"] = failure
         result.setdefault("diagnostics", {})["Service activation result"] = "failed"
+        result["diagnostics"].update(startup_report)
     elif result.get("error"):
         result.setdefault("diagnostics", {})["Service activation result"] = "request accepted; Proton verification failed"
     return result
-
-
-class _CLICommandError(RuntimeError):
-    def __init__(self, message: str, category: str, identifiers: str = "not reported"):
-        super().__init__(message)
-        self.category = category
-        self.identifiers = identifiers
-
-
-def _run_cli(arguments: list[str]) -> str:
-    operation = {
-        "info": "account check",
-        "status": "connection status",
-        "countries": "country list",
-        "connect": "connection",
-        "disconnect": "disconnection",
-    }.get(arguments[0] if arguments else "", "command")
-    try:
-        result = subprocess.run(
-            [*PROTON_CLI_COMMAND, *arguments],
-            capture_output=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            timeout=CLI_TIMEOUT_SECONDS,
-            env=_cli_environment(),
-            start_new_session=True,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Proton VPN {operation} timed out; refresh status before retrying") from None
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        raise RuntimeError("Proton VPN CLI is unavailable") from None
-    if result.returncode != 0:
-        message = f"{result.stderr}\n{result.stdout}".strip()
-        lowered = message.casefold()
-        if "desktop app is currently running" in lowered or "cannot run alongside" in lowered:
-            raise RuntimeError(
-                "Close the Proton VPN desktop app before using the Decky CLI controls"
-            )
-        if "authentication required" in lowered or "please sign in" in lowered:
-            raise RuntimeError("Proton CLI is signed out; sign in first")
-        category = _command_failure_category(message)
-        identifiers = ", ".join(identifier for identifier in (
-            "InitError", "KeyringLocked", "KeyringError", "NoKeyringError",
-            "LockedException", "PromptDismissedException", "ItemNotFoundException",
-            "SecretServiceNotAvailableException", "ServiceUnknown", "NoReply", "AccessDenied",
-        ) if re.search(rf"\b{identifier}\b", message)) or "not reported"
-        raise _CLICommandError(
-            f"Proton VPN {operation} failed: {category} (exit {result.returncode})",
-            category,
-            identifiers,
-        )
-    return result.stdout.strip()
-
-
-def _flatpak_installed() -> bool:
-    try:
-        result = subprocess.run(
-            [FLATPAK, "list", "--app", "--columns=application"],
-            capture_output=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            timeout=10,
-            env=_cli_environment(),
-        )
-    except FileNotFoundError:
-        raise RuntimeError("Flatpak is unavailable to Decky; check the plugin's runtime environment") from None
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Flatpak installation check timed out; refresh status") from None
-    except (OSError, UnicodeError):
-        raise RuntimeError("Decky could not run Flatpak; check user permissions") from None
-    if result.returncode != 0:
-        output = f"{result.stderr}\n{result.stdout}".casefold()
-        category = _command_failure_category(output)
-        raise RuntimeError(f"Flatpak installation check failed: {category} (exit {result.returncode})")
-    return PROTON_APP_ID in {line.strip() for line in result.stdout.splitlines()}
-
-
-def _signed_in() -> bool:
-    output = _run_cli(["info"])
-    account_line = next(
-        (line for line in output.splitlines() if line.startswith("Account:")),
-        "",
-    )
-    account = account_line.partition(":")[2].strip().strip("'\"")
-    return bool(account and account.casefold() != "none")
-
-
-def _parse_status(output: str) -> dict[str, str | bool]:
-    values: dict[str, str | bool] = {
-        "connected": False,
-        "server": "",
-        "protocol": "",
-    }
-    for line in output.splitlines():
-        label, separator, value = line.partition(":")
-        if not separator:
-            continue
-        key = label.strip().casefold()
-        value = value.strip()
-        if key == "status":
-            values["connected"] = value.casefold() == "connected"
-        elif key == "server":
-            values["server"] = value
-        elif key == "protocol":
-            values["protocol"] = value
-    return values
 
 
 def _get_status() -> dict:
     installed = None
     signed_in = None
     try:
-        installed = _flatpak_installed()
+        installed = proton_cli.flatpak_installed()
         if not installed:
             return {"installed": False, "signed_in": False, "connected": False}
-        signed_in = _signed_in()
+        signed_in = proton_cli.signed_in()
         if not signed_in:
             return {
                 "installed": True,
@@ -657,7 +270,7 @@ def _get_status() -> dict:
                 "server": "",
                 "protocol": "",
             }
-        status = _parse_status(_run_cli(["status"]))
+        status = proton_cli.parse_status(proton_cli.run_cli(["status"]))
         return {"installed": True, "signed_in": signed_in, **status}
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         result = {
@@ -668,12 +281,12 @@ def _get_status() -> dict:
             "protocol": "",
             "error": str(error),
         }
-        if isinstance(error, _CLICommandError) and error.category in (
+        if isinstance(error, proton_cli.CLICommandError) and error.category in (
             "keyring error", "keyring locked", "keyring unlock dismissed",
             "keyring backend unavailable", "Secret Service unavailable",
         ):
             try:
-                result["diagnostics"] = _keyring_diagnostics()
+                result["diagnostics"] = keyring.diagnostics()
             except Exception:
                 result["diagnostics"] = {"Probe": "unavailable"}
             result["diagnostics"]["CLI exception types"] = error.identifiers
@@ -682,27 +295,15 @@ def _get_status() -> dict:
         return result
 
 
-def _parse_countries(output: str) -> list[dict[str, str]]:
-    countries = []
-    for line in output.splitlines():
-        match = re.match(r"^\s*(.+?)\s{2,}([A-Z]{2})\s*$", line)
-        if not match:
-            continue
-        name, country_code = match.groups()
-        if name.casefold() != "country":
-            countries.append({"name": name.strip(), "code": country_code})
-    return countries
-
-
 def _get_countries() -> dict:
     try:
-        if not _flatpak_installed():
+        if not proton_cli.flatpak_installed():
             return {"signed_in": False, "countries": []}
-        if not _signed_in():
+        if not proton_cli.signed_in():
             return {"signed_in": False, "countries": []}
         return {
             "signed_in": True,
-            "countries": _parse_countries(_run_cli(["countries", "list"])),
+            "countries": proton_cli.parse_countries(proton_cli.run_cli(["countries", "list"])),
         }
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         return {"signed_in": False, "countries": [], "error": str(error)}
@@ -718,16 +319,16 @@ def _connect_country(country_code: str) -> dict:
         raise RuntimeError("Sign in to the Proton VPN CLI from Desktop Mode first")
     if country_code not in {country["code"] for country in country_data["countries"]}:
         raise ValueError("That country is not in Proton VPN's available country list")
-    _run_cli(["connect", "--country", country_code])
+    proton_cli.run_cli(["connect", "--country", country_code])
     return _get_status()
 
 
 def _disconnect() -> dict:
-    if not _flatpak_installed():
+    if not proton_cli.flatpak_installed():
         raise RuntimeError("Proton VPN is not installed")
-    if not _signed_in():
+    if not proton_cli.signed_in():
         raise RuntimeError("Sign in to the Proton VPN CLI from Desktop Mode first")
-    _run_cli(["disconnect"])
+    proton_cli.run_cli(["disconnect"])
     return _get_status()
 
 

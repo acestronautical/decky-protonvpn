@@ -71,7 +71,19 @@ The report also checks the host user bus using `/usr/bin/busctl`, because Flatpa
 
 Activation runs as the Deck user, never root. It does not install packages, enable persistent services, replace a running provider, change Flatpak permissions, force Proton's JSON backend, or handle the wallet password. A provider may still need its normal unlock prompt; starting it is not proof that Proton can use its credentials. If no provider is registered, or startup fails, the panel reports that outcome instead of silently weakening storage security. A host service that is running but invisible inside Flatpak is reported separately and is not replaced.
 
+If an activation request fails, the panel preserves recognized D-Bus startup errors (including process termination signals) and reads at most 40 recent KDE wallet journal entries from the current boot, current user, and activation time onward. This extra read has a six-second timeout. Only fixed descriptions of recognized Qt display/platform failures, disabled-wallet configuration, library failures, or PAM unlock failures are displayed; raw messages are never displayed or logged by the plugin. Missing or inaccessible journal entries are reported as missing evidence, not a healthy service. These findings do not trigger automatic display overrides, a headless wallet, or repeated startup attempts. KDE uses a Qt GUI application, but a missing display in Decky's environment alone does not establish why D-Bus activation failed.
+
 ## Development on Steam Deck
+
+### Backend Layout
+
+- `main.py`: Decky RPCs, operation serialization, encrypted sign-in sessions, and status/recovery orchestration.
+- `py_modules/protonvpn/proton_cli.py`: subprocess environment, Flatpak detection, CLI execution, sanitized errors, and output parsing.
+- `py_modules/protonvpn/keyring.py`: read-only probes, provider selection, service activation, and sanitized startup diagnostics.
+
+Decky adds `py_modules` to Python's module search path. The helper package does not import `main.py` or Decky; status verification after activation stays in `main.py`. Packaging includes the helper sources, tests reproduce Decky's import path, and `pyrightconfig.json` supplies the same path for editor analysis.
+
+### Local Commands
 
 The workflow below was tested from Desktop Mode. On systems with Node.js and pnpm 9 available, the script uses them. If those commands are unavailable but VS Code's Flatpak is installed, it uses VS Code's bundled Node and caches pnpm 9.15.9 under `~/.cache/decky-protonvpn`; it does not install packages into SteamOS.
 

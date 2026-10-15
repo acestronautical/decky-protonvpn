@@ -3,6 +3,8 @@ import base64
 import io
 import json
 import logging
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,30 +13,113 @@ import types
 import unittest
 from contextlib import redirect_stdout
 from importlib import metadata
+from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 sys.modules.setdefault("decky", types.ModuleType("decky"))
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "py_modules"))
+
 import main
+from protonvpn import keyring, proton_cli
+
+
+class BackendPackagingTests(unittest.TestCase):
+    def test_backend_loads_with_only_decky_module_search_path(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            staged = Path(directory)
+            shutil.copy2(root / "main.py", staged / "main.py")
+            shutil.copytree(root / "py_modules", staged / "py_modules", ignore=shutil.ignore_patterns("__pycache__"))
+            subprocess.run(
+                [sys.executable, "-I", "-c", """
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.append(str(root / "py_modules"))
+from protonvpn import keyring, proton_cli
+assert "decky" not in sys.modules
+assert "main" not in sys.modules
+assert Path(keyring.__file__).parent == root / "py_modules" / "protonvpn"
+assert Path(proton_cli.__file__).parent == root / "py_modules" / "protonvpn"
+sys.modules["decky"] = types.ModuleType("decky")
+spec = importlib.util.spec_from_file_location("_", root / "main.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert callable(module.Plugin().get_status)
+assert callable(module.Plugin().start_keyring)
+assert module.keyring is keyring
+assert module.proton_cli is proton_cli
+""", directory],
+                cwd=directory, check=True, capture_output=True, text=True, timeout=10,
+            )
 
 
 class KeyringServiceTests(unittest.TestCase):
+    def test_startup_log_is_scoped_bounded_and_only_reports_fixed_findings(self):
+        output = "\n".join(json.dumps({"MESSAGE": message, "_HOSTNAME": "private-data"}) for message in (
+            "qt.qpa.xcb: could not connect to display private-data",
+            "No Qt platform plugin could be initialized. private-data",
+            "private-data",
+        ))
+        with (
+            patch.object(os, "getuid", return_value=1000),
+            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "private-data")) as run,
+        ):
+            report = keyring.startup_diagnostics(1234.5)
+        self.assertEqual(report, {"KDE startup log": "Qt could not connect to a display; Qt platform initialization failed"})
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], keyring.JOURNALCTL)
+        for argument in ("--boot", "--since=@1234.500000", "--lines=40", "--output=json", "--output-fields=MESSAGE", "_UID=1000", "_COMM=ksecretd"):
+            self.assertIn(argument, command)
+        self.assertNotIn("+", command)
+        self.assertEqual(run.call_args.kwargs["timeout"], 6)
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertTrue(run.call_args.kwargs["start_new_session"])
+        self.assertNotIn("private-data", json.dumps(report))
+
+    def test_startup_log_does_not_treat_missing_evidence_as_success(self):
+        for output, expected in (
+            ("", "no matching entries"),
+            ("private-data", "unreadable entries"),
+            ('{"MESSAGE":42}', "unreadable entries"),
+            ('{"MESSAGE":"private-data"}', "no recognized failure in recent entries"),
+            ('{"MESSAGE":"ksecretd is disabled! private-data"}', "KDE wallet disabled in configuration"),
+        ):
+            with self.subTest(output=output), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "private-data")):
+                self.assertEqual(keyring.startup_diagnostics(1234), {"KDE startup log": expected})
+        for failure, expected in (
+            (OSError("private-data"), "unavailable"),
+            (subprocess.TimeoutExpired([], 6, output="private-data"), "check timed out"),
+        ):
+            with self.subTest(failure=type(failure).__name__), patch.object(subprocess, "run", side_effect=failure):
+                self.assertEqual(keyring.startup_diagnostics(1234), {"KDE startup log": expected})
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "private-data", "private-data")):
+            self.assertEqual(keyring.startup_diagnostics(1234), {"KDE startup log": "unavailable"})
+
     def test_user_bus_errors_never_expose_raw_output(self):
         for stderr, message in (
             ("org.freedesktop.DBus.Error.ServiceUnknown: private-data", "service not registered"),
             ("org.freedesktop.DBus.Error.AccessDenied: private-data", "access denied"),
             ("org.freedesktop.DBus.Error.NoReply: private-data", "service did not respond"),
             ("org.freedesktop.DBus.Error.Spawn.ChildExited: private-data", "service exited during startup"),
+            ("Call failed: Process org.kde.secretservicecompat received signal 6 private-data", "service terminated by a signal during startup; signal 6"),
+            ("org.freedesktop.DBus.Error.Spawn.ChildSignaled: private-data", "service terminated by a signal during startup"),
+            ("Call failed: Failed to execute program /private-data: No such file or directory", "service executable could not be started"),
+            ("Process private-data exited abnormally", "service exited abnormally during startup"),
             ("private-data", "service operation failed"),
         ):
-            with self.subTest(stderr=stderr), patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "private-data", stderr)):
+            with self.subTest(stderr=stderr), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "private-data", stderr)):
                 with self.assertRaisesRegex(RuntimeError, message) as raised:
-                    main._user_bus_call("ListNames")
+                    keyring.user_bus_call("ListNames")
                 self.assertNotIn("private-data", str(raised.exception))
         for failure in (OSError("private-data"), subprocess.TimeoutExpired([], 6, output="private-data")):
-            with self.subTest(failure=type(failure).__name__), patch.object(main.subprocess, "run", side_effect=failure):
+            with self.subTest(failure=type(failure).__name__), patch.object(subprocess, "run", side_effect=failure):
                 with self.assertRaises(RuntimeError) as raised:
-                    main._user_bus_call("ListNames")
+                    keyring.user_bus_call("ListNames")
                 self.assertNotIn("private-data", str(raised.exception))
 
     def test_user_bus_rejects_malformed_replies_and_arbitrary_activation(self):
@@ -46,26 +131,30 @@ class KeyringServiceTests(unittest.TestCase):
             ("StartServiceByName", '{"type":"u","data":[true]}'),
             ("StartServiceByName", '{"type":"u","data":[3]}'),
         ):
-            with self.subTest(output=output), patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")):
+            with self.subTest(output=output), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")):
                 with self.assertRaisesRegex(RuntimeError, "invalid response"):
-                    main._user_bus_call(method, "org.kde.kwalletd6" if method == "StartServiceByName" else None)
-        with patch.object(main.subprocess, "run") as run:
+                    keyring.user_bus_call(method, "org.kde.kwalletd6" if method == "StartServiceByName" else None)
+        with patch.object(subprocess, "run") as run:
             with self.assertRaises(ValueError):
-                main._user_bus_call("StartServiceByName", "org.example.unknown")
+                keyring.user_bus_call("StartServiceByName", "org.example.unknown")
             with self.assertRaises(ValueError):
-                main._user_bus_call("UpdateActivationEnvironment")
+                keyring.user_bus_call("UpdateActivationEnvironment")
             run.assert_not_called()
 
     def test_failed_service_activation_is_preserved_after_status_refresh(self):
         with (
-            patch.object(main.os, "getuid", return_value=1000),
-            patch.object(main, "_user_bus_call", side_effect=[set(), {"org.kde.kwalletd6"}, RuntimeError("service exited during startup")]),
+            patch.object(os, "getuid", return_value=1000),
+            patch.object(keyring.time, "time", return_value=1234.5),
+            patch.object(keyring, "startup_diagnostics", return_value={"KDE startup log": "Qt could not connect to a display"}) as startup,
+            patch.object(keyring, "user_bus_call", side_effect=[set(), {"org.kde.kwalletd6"}, RuntimeError("service exited during startup")]),
             patch.object(main, "_get_status", return_value={"signed_in": True, "connected": None, "error": "Secret Service unavailable"}),
         ):
             report = main._start_keyring_service()
         self.assertTrue(report["signed_in"])
         self.assertEqual(report["error"], "service exited during startup")
         self.assertEqual(report["diagnostics"]["Service activation result"], "failed")
+        self.assertEqual(report["diagnostics"]["KDE startup log"], "Qt could not connect to a display")
+        startup.assert_called_once_with(1234.5)
 
     def test_start_keyring_rpc_serializes_operations_and_returns_expected_errors(self):
         with patch.object(main, "_cli_operation", return_value={"signed_in": True}) as operation:
@@ -83,10 +172,10 @@ class KeyringServiceTests(unittest.TestCase):
             ("StartServiceByName", {"type": "u", "data": [1]}, set()),
             ("StartServiceByName", {"type": "u", "data": [2]}, set()),
         ):
-            with self.subTest(method=method), patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(response), "private-data")) as run:
-                self.assertEqual(main._user_bus_call(method, "org.kde.kwalletd6" if method == "StartServiceByName" else None), expected)
+            with self.subTest(method=method), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(response), "private-data")) as run:
+                self.assertEqual(keyring.user_bus_call(method, "org.kde.kwalletd6" if method == "StartServiceByName" else None), expected)
                 command = run.call_args.args[0]
-                self.assertEqual(command[:4], [main.BUSCTL, "--user", "--timeout=5", "--json=short"])
+                self.assertEqual(command[:4], [keyring.BUSCTL, "--user", "--timeout=5", "--json=short"])
                 self.assertEqual(run.call_args.kwargs["timeout"], 6)
                 self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
                 self.assertTrue(run.call_args.kwargs["start_new_session"])
@@ -98,8 +187,8 @@ class KeyringServiceTests(unittest.TestCase):
             status = {"installed": True, "signed_in": True, "connected": False}
             with (
                 self.subTest(service=service),
-                patch.object(main.os, "getuid", return_value=1000),
-                patch.object(main, "_user_bus_call", side_effect=[set(), {service}, set()]) as bus,
+                patch.object(os, "getuid", return_value=1000),
+                patch.object(keyring, "user_bus_call", side_effect=[set(), {service}, set()]) as bus,
                 patch.object(main, "_get_status", return_value=status) as get_status,
             ):
                 self.assertEqual(main._start_keyring_service(), status)
@@ -108,22 +197,24 @@ class KeyringServiceTests(unittest.TestCase):
 
     def test_activation_never_replaces_running_service(self):
         with (
-            patch.object(main.os, "getuid", return_value=1000),
-            patch.object(main, "_user_bus_call", return_value={"org.freedesktop.secrets"}) as bus,
+            patch.object(os, "getuid", return_value=1000),
+            patch.object(keyring, "startup_diagnostics") as startup,
+            patch.object(keyring, "user_bus_call", return_value={"org.freedesktop.secrets"}) as bus,
             patch.object(main, "_get_status", return_value={"signed_in": True}),
         ):
             main._start_keyring_service()
             bus.assert_called_once_with("ListNames")
+            startup.assert_not_called()
 
     def test_activation_refuses_root_missing_or_ambiguous_providers(self):
-        with patch.object(main.os, "getuid", return_value=0), patch.object(main, "_user_bus_call") as bus:
+        with patch.object(os, "getuid", return_value=0), patch.object(keyring, "user_bus_call") as bus:
             self.assertIn("not root", main._start_keyring_service()["error"])
             bus.assert_not_called()
         for names in (set(), {"org.kde.kwalletd6", "org.gnome.keyring"}):
             with (
                 self.subTest(names=names),
-                patch.object(main.os, "getuid", return_value=1000),
-                patch.object(main, "_user_bus_call", side_effect=[set(), names]) as bus,
+                patch.object(os, "getuid", return_value=1000),
+                patch.object(keyring, "user_bus_call", side_effect=[set(), names]) as bus,
                 patch.object(main, "_get_status", return_value={"signed_in": True}),
             ):
                 result = main._start_keyring_service()
@@ -133,8 +224,8 @@ class KeyringServiceTests(unittest.TestCase):
 
     def test_failed_proton_verification_is_not_reported_as_repaired(self):
         with (
-            patch.object(main.os, "getuid", return_value=1000),
-            patch.object(main, "_user_bus_call", side_effect=[set(), {"org.kde.kwalletd6"}, set()]),
+            patch.object(os, "getuid", return_value=1000),
+            patch.object(keyring, "user_bus_call", side_effect=[set(), {"org.kde.kwalletd6"}, set()]),
             patch.object(main, "_get_status", return_value={"signed_in": True, "connected": None, "error": "keyring locked"}),
         ):
             result = main._start_keyring_service()
@@ -149,10 +240,10 @@ class KeyringServiceTests(unittest.TestCase):
         ):
             with (
                 self.subTest(available=available),
-                patch.object(main.os, "getuid", return_value=1000),
-                patch.object(main, "_user_bus_call", side_effect=[set(), available]),
+                patch.object(os, "getuid", return_value=1000),
+                patch.object(keyring, "user_bus_call", side_effect=[set(), available]),
             ):
-                report = main._host_keyring_diagnostics()
+                report = keyring.host_diagnostics()
                 self.assertEqual(report["Keyring service activation"], expected)
                 self.assertNotIn("private-data", json.dumps(report))
 
@@ -166,9 +257,9 @@ class KeyringServiceTests(unittest.TestCase):
             ({"org.example.unknown"}, None),
         ):
             with self.subTest(names=names):
-                self.assertEqual(main._select_keyring_service(names), expected)
+                self.assertEqual(keyring.select_service(names), expected)
         with self.assertRaisesRegex(RuntimeError, "Multiple keyring providers"):
-            main._select_keyring_service({"org.kde.kwalletd6", "org.gnome.keyring"})
+            keyring.select_service({"org.kde.kwalletd6", "org.gnome.keyring"})
 
 
 class KeyringDiagnosticTests(unittest.TestCase):
@@ -207,7 +298,7 @@ class KeyringDiagnosticTests(unittest.TestCase):
             }),
             redirect_stdout(output),
         ):
-            exec(compile(main.KEYRING_PROBE_CODE, "keyring-probe", "exec"), {})
+            exec(compile(keyring.KEYRING_PROBE_CODE, "keyring-probe", "exec"), {})
         self.assertNotIn("private-data", output.getvalue())
         if bus_error:
             connection.close.assert_not_called()
@@ -257,7 +348,7 @@ class KeyringDiagnosticTests(unittest.TestCase):
             patch.object(metadata, "entry_points", side_effect=RuntimeError("private-data")),
             redirect_stdout(output),
         ):
-            exec(main.KEYRING_PROBE_CODE, {})
+            exec(keyring.KEYRING_PROBE_CODE, {})
         self.assertEqual(json.loads(output.getvalue()), {"probe": "dependencies missing"})
 
     def test_diagnostics_compare_user_bus_without_mutating_environment(self):
@@ -266,12 +357,12 @@ class KeyringDiagnosticTests(unittest.TestCase):
             before = dict(inherited)
             with (
                 self.subTest(inherited_bus=inherited_bus),
-                patch.object(main.os, "getuid", return_value=1000),
-                patch.object(main, "_cli_environment", return_value=inherited),
-                patch.object(main, "_host_keyring_diagnostics", return_value={}),
-                patch.object(main, "_probe_keyring", return_value={"bus": "reachable", "collection": "locked"}) as probe,
+                patch.object(os, "getuid", return_value=1000),
+                patch.object(proton_cli, "cli_environment", return_value=inherited),
+                patch.object(keyring, "host_diagnostics", return_value={}),
+                patch.object(keyring, "probe_keyring", return_value={"bus": "reachable", "collection": "locked"}) as probe,
             ):
-                report = main._keyring_diagnostics()
+                report = keyring.diagnostics()
                 self.assertEqual(probe.call_count, expected_calls)
                 self.assertEqual(probe.call_args.args[0]["DBUS_SESSION_BUS_ADDRESS"], "unix:path=/run/user/1000/bus")
                 self.assertEqual(report["Default collection"], "locked")
@@ -283,17 +374,17 @@ class KeyringDiagnosticTests(unittest.TestCase):
             (subprocess.TimeoutExpired([], 10, output="private-data"), "timed out"),
             (OSError("private-data"), "unavailable"),
         ):
-            with self.subTest(expected=expected), patch.object(main.subprocess, "run", side_effect=failure):
-                self.assertEqual(main._probe_keyring({}), {"probe": expected})
+            with self.subTest(expected=expected), patch.object(subprocess, "run", side_effect=failure):
+                self.assertEqual(keyring.probe_keyring({}), {"probe": expected})
 
     def test_status_failure_attaches_diagnostics_without_signing_in_again(self):
         for category in ("keyring error", "keyring locked", "keyring unlock dismissed", "keyring backend unavailable", "Secret Service unavailable"):
-            failure = main._CLICommandError("status failed", category)
+            failure = proton_cli.CLICommandError("status failed", category)
             with (
                 self.subTest(category=category),
-                patch.object(main, "_flatpak_installed", return_value=True),
-                patch.object(main, "_run_cli", side_effect=["Account: 'private-user'", failure]) as cli,
-                patch.object(main, "_keyring_diagnostics", return_value={"Default collection": "locked"}) as probe,
+                patch.object(proton_cli, "flatpak_installed", return_value=True),
+                patch.object(proton_cli, "run_cli", side_effect=["Account: 'private-user'", failure]) as cli,
+                patch.object(keyring, "diagnostics", return_value={"Default collection": "locked"}) as probe,
                 patch.object(main.decky, "logger", create=True) as logger,
             ):
                 report = main._get_status()
@@ -308,10 +399,10 @@ class KeyringDiagnosticTests(unittest.TestCase):
 
     def test_broken_diagnostics_do_not_hide_original_failure(self):
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
-            patch.object(main, "_signed_in", return_value=True),
-            patch.object(main, "_run_cli", side_effect=main._CLICommandError("status failed", "keyring error")),
-            patch.object(main, "_keyring_diagnostics", side_effect=RuntimeError("private-data")),
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
+            patch.object(proton_cli, "signed_in", return_value=True),
+            patch.object(proton_cli, "run_cli", side_effect=proton_cli.CLICommandError("status failed", "keyring error")),
+            patch.object(keyring, "diagnostics", side_effect=RuntimeError("private-data")),
             patch.object(main.decky, "logger", create=True),
         ):
             report = main._get_status()
@@ -323,11 +414,11 @@ class KeyringDiagnosticTests(unittest.TestCase):
 class ProtonCLITests(unittest.TestCase):
     def test_keyring_metadata_and_exception_identifiers_are_allowlisted(self):
         output = json.dumps({"drivers": ["json", "secret_service"], "cli_version": "1.2.3", "keyring_version": "private-data"})
-        with patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")):
-            self.assertEqual(main._probe_keyring({}), {"drivers": "json, secret_service", "cli_version": "1.2.3"})
-        with patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "keyring.errors.InitError: private-data org.freedesktop.DBus.Error.NoReply")):
-            with self.assertRaises(main._CLICommandError) as raised:
-                main._run_cli(["status"])
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")):
+            self.assertEqual(keyring.probe_keyring({}), {"drivers": "json, secret_service", "cli_version": "1.2.3"})
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "keyring.errors.InitError: private-data org.freedesktop.DBus.Error.NoReply")):
+            with self.assertRaises(proton_cli.CLICommandError) as raised:
+                proton_cli.run_cli(["status"])
         self.assertEqual(raised.exception.identifiers, "InitError, NoReply")
         self.assertNotIn("private", str(raised.exception))
 
@@ -336,8 +427,8 @@ class ProtonCLITests(unittest.TestCase):
             "bus": "reachable", "service": "running", "provider": "KWallet",
             "collection": "locked", "private-token": "private-data",
         })
-        with patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "private-data")) as run:
-            report = main._probe_keyring({"LC_ALL": "C"})
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "private-data")) as run:
+            report = keyring.probe_keyring({"LC_ALL": "C"})
         self.assertEqual(report, {
             "bus": "reachable", "service": "running", "provider": "KWallet",
             "collection": "locked",
@@ -354,8 +445,8 @@ class ProtonCLITests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, json.dumps({"bus": "private-data"}), ""),
             subprocess.CompletedProcess([], 0, "[]", ""),
         ):
-            with self.subTest(result=result), patch.object(main.subprocess, "run", return_value=result):
-                self.assertEqual(main._probe_keyring({}), {"probe": "unavailable"})
+            with self.subTest(result=result), patch.object(subprocess, "run", return_value=result):
+                self.assertEqual(keyring.probe_keyring({}), {"probe": "unavailable"})
 
     def test_keyring_failure_categories_do_not_expose_secrets(self):
         for output, category in (
@@ -368,7 +459,7 @@ class ProtonCLITests(unittest.TestCase):
             ("keyring.errors.KeyringError: private-data", "keyring error"),
         ):
             with self.subTest(category=category):
-                self.assertEqual(main._command_failure_category(output), category)
+                self.assertEqual(proton_cli.command_failure_category(output), category)
 
     def test_cli_errors_identify_stage_and_redact_raw_output(self):
         for arguments, stderr, stage, category in (
@@ -378,10 +469,10 @@ class ProtonCLITests(unittest.TestCase):
         ):
             with (
                 self.subTest(arguments=arguments),
-                patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", stderr)),
+                patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", stderr)),
             ):
                 with self.assertRaises(RuntimeError) as raised:
-                    main._run_cli(arguments)
+                    proton_cli.run_cli(arguments)
                 message = str(raised.exception)
                 self.assertIn(stage, message)
                 self.assertIn(category, message)
@@ -390,8 +481,8 @@ class ProtonCLITests(unittest.TestCase):
 
     def test_status_failure_preserves_confirmed_signin(self):
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
-            patch.object(main, "_run_cli", side_effect=["Account: 'dummy-user'", RuntimeError("status failed")]),
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
+            patch.object(proton_cli, "run_cli", side_effect=["Account: 'dummy-user'", RuntimeError("status failed")]),
         ):
             result = main._get_status()
         self.assertTrue(result["signed_in"])
@@ -400,8 +491,8 @@ class ProtonCLITests(unittest.TestCase):
 
     def test_failed_account_check_is_not_signed_out(self):
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
-            patch.object(main, "_run_cli", side_effect=RuntimeError("account check failed")),
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
+            patch.object(proton_cli, "run_cli", side_effect=RuntimeError("account check failed")),
         ):
             result = main._get_status()
         self.assertIsNone(result["signed_in"])
@@ -416,32 +507,32 @@ class ProtonCLITests(unittest.TestCase):
             "HOME": "/home/deck",
         }
         with (
-            patch.dict(main.os.environ, inherited, clear=True),
+            patch.dict(os.environ, inherited, clear=True),
             patch.object(sys, "frozen", True, create=True),
         ):
-            environment = main._cli_environment()
+            environment = proton_cli.cli_environment()
             self.assertEqual(environment["LD_LIBRARY_PATH"], "/system/libs")
             self.assertNotIn("LD_LIBRARY_PATH_ORIG", environment)
             self.assertEqual(environment["DBUS_SESSION_BUS_ADDRESS"], inherited["DBUS_SESSION_BUS_ADDRESS"])
             self.assertEqual(environment["XDG_RUNTIME_DIR"], inherited["XDG_RUNTIME_DIR"])
             self.assertEqual(environment["HOME"], inherited["HOME"])
-            self.assertEqual(dict(main.os.environ), inherited)
+            self.assertEqual(dict(os.environ), inherited)
 
     def test_frozen_environment_removes_library_path_without_original(self):
         for original in ({}, {"LD_LIBRARY_PATH_ORIG": ""}):
             with (
                 self.subTest(original=original),
-                patch.dict(main.os.environ, {"LD_LIBRARY_PATH": "/tmp/_MEIdecky", **original}, clear=True),
+                patch.dict(os.environ, {"LD_LIBRARY_PATH": "/tmp/_MEIdecky", **original}, clear=True),
                 patch.object(sys, "frozen", True, create=True),
             ):
-                self.assertNotIn("LD_LIBRARY_PATH", main._cli_environment())
+                self.assertNotIn("LD_LIBRARY_PATH", proton_cli.cli_environment())
 
     def test_unfrozen_environment_preserves_custom_library_path(self):
         with (
-            patch.dict(main.os.environ, {"LD_LIBRARY_PATH": "/custom/libs"}, clear=True),
+            patch.dict(os.environ, {"LD_LIBRARY_PATH": "/custom/libs"}, clear=True),
             patch.object(sys, "frozen", False, create=True),
         ):
-            self.assertEqual(main._cli_environment()["LD_LIBRARY_PATH"], "/custom/libs")
+            self.assertEqual(proton_cli.cli_environment()["LD_LIBRARY_PATH"], "/custom/libs")
 
     def test_flatpak_failure_identifies_category_without_echoing_output(self):
         for stderr, category in (
@@ -454,18 +545,18 @@ class ProtonCLITests(unittest.TestCase):
         ):
             with (
                 self.subTest(category=category),
-                patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", stderr)),
+                patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", stderr)),
             ):
                 with self.assertRaises(RuntimeError) as raised:
-                    main._flatpak_installed()
+                    proton_cli.flatpak_installed()
                 self.assertIn(category, str(raised.exception))
                 self.assertIn("exit 1", str(raised.exception))
                 self.assertNotIn("private diagnostic", str(raised.exception))
 
     def test_detection_error_returns_unknown_installation_status(self):
         with (
-            patch.object(main, "_flatpak_installed", side_effect=RuntimeError("Flatpak check failed")),
-            patch.object(main, "_run_cli") as run_cli,
+            patch.object(proton_cli, "flatpak_installed", side_effect=RuntimeError("Flatpak check failed")),
+            patch.object(proton_cli, "run_cli") as run_cli,
         ):
             result = main._get_status()
             countries = main._get_countries()
@@ -476,38 +567,38 @@ class ProtonCLITests(unittest.TestCase):
 
     def test_flatpak_detection_checks_application_list(self):
         with patch.object(
-            main.subprocess, "run",
+            subprocess, "run",
             return_value=subprocess.CompletedProcess([], 0, "com.protonvpn.www\n", ""),
         ) as run:
-            self.assertTrue(main._flatpak_installed())
-        self.assertEqual(run.call_args.args[0], [main.FLATPAK, "list", "--app", "--columns=application"])
+            self.assertTrue(proton_cli.flatpak_installed())
+        self.assertEqual(run.call_args.args[0], [proton_cli.FLATPAK, "list", "--app", "--columns=application"])
 
     def test_flatpak_detection_reports_absence_only_after_successful_query(self):
         with patch.object(
-            main.subprocess, "run",
+            subprocess, "run",
             return_value=subprocess.CompletedProcess([], 0, "org.example.Other\n", ""),
         ):
-            self.assertFalse(main._flatpak_installed())
+            self.assertFalse(proton_cli.flatpak_installed())
 
     def test_flatpak_detection_does_not_hide_failures_as_missing_app(self):
         failures = [
             FileNotFoundError(), PermissionError(),
-            subprocess.TimeoutExpired([main.FLATPAK], 10),
+            subprocess.TimeoutExpired([proton_cli.FLATPAK], 10),
         ]
         for failure in failures:
-            with self.subTest(failure=type(failure).__name__), patch.object(main.subprocess, "run", side_effect=failure):
+            with self.subTest(failure=type(failure).__name__), patch.object(subprocess, "run", side_effect=failure):
                 with self.assertRaises(RuntimeError):
-                    main._flatpak_installed()
+                    proton_cli.flatpak_installed()
         with patch.object(
-            main.subprocess, "run",
+            subprocess, "run",
             return_value=subprocess.CompletedProcess([], 1, "", "private diagnostic"),
         ):
             with self.assertRaisesRegex(RuntimeError, "Flatpak") as raised:
-                main._flatpak_installed()
+                proton_cli.flatpak_installed()
             self.assertNotIn("private diagnostic", str(raised.exception))
 
     def test_parse_status_extracts_connection_details(self):
-        status = main._parse_status(
+        status = proton_cli.parse_status(
             "Status: Connected\nServer: US-CA#856 in San Jose, United States\n"
             "Load: 48%\nProtocol: wireguard"
         )
@@ -521,7 +612,7 @@ class ProtonCLITests(unittest.TestCase):
         )
 
     def test_parse_countries_skips_heading_and_parses_names(self):
-        countries = main._parse_countries(
+        countries = proton_cli.parse_countries(
             "Country                           Code\n"
             "--------------------------------  ------\n"
             "Canada                            CA\n"
@@ -537,10 +628,10 @@ class ProtonCLITests(unittest.TestCase):
 
     def test_status_does_not_return_account_name(self):
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
             patch.object(
-                main,
-                "_run_cli",
+                proton_cli,
+                "run_cli",
                 side_effect=[
                     "Account: 'user@example.com'",
                     "Status: Connected\nServer: US-CA#856\nProtocol: wireguard",
@@ -555,10 +646,10 @@ class ProtonCLITests(unittest.TestCase):
 
     def test_status_detects_cli_signed_out(self):
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
             patch.object(
-                main,
-                "_run_cli",
+                proton_cli,
+                "run_cli",
                 side_effect=["Account: 'None'", "Status: Disconnected"],
             ),
         ):
@@ -569,8 +660,8 @@ class ProtonCLITests(unittest.TestCase):
 
     def test_missing_app_returns_install_guidance_state(self):
         with (
-            patch.object(main, "_flatpak_installed", return_value=False),
-            patch.object(main, "_run_cli") as run_cli,
+            patch.object(proton_cli, "flatpak_installed", return_value=False),
+            patch.object(proton_cli, "run_cli") as run_cli,
         ):
             status = main._get_status()
 
@@ -579,11 +670,11 @@ class ProtonCLITests(unittest.TestCase):
 
     def test_get_countries_uses_proton_cli(self):
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
-            patch.object(main, "_signed_in", return_value=True),
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
+            patch.object(proton_cli, "signed_in", return_value=True),
             patch.object(
-                main,
-                "_run_cli",
+                proton_cli,
+                "run_cli",
                 return_value="Country  Code\nCanada   CA\nUnited States US",
             ) as run_cli,
         ):
@@ -599,7 +690,7 @@ class ProtonCLITests(unittest.TestCase):
                 "_get_countries",
                 return_value={"signed_in": True, "countries": [{"name": "Canada", "code": "CA"}]},
             ),
-            patch.object(main, "_run_cli") as run_cli,
+            patch.object(proton_cli, "run_cli") as run_cli,
             patch.object(main, "_get_status", return_value={"connected": True}),
         ):
             result = main._connect_country("CA")
@@ -614,7 +705,7 @@ class ProtonCLITests(unittest.TestCase):
                 "_get_countries",
                 return_value={"signed_in": True, "countries": [{"name": "Canada", "code": "CA"}]},
             ),
-            patch.object(main, "_run_cli") as run_cli,
+            patch.object(proton_cli, "run_cli") as run_cli,
         ):
             with self.assertRaisesRegex(ValueError, "available country list"):
                 main._connect_country("US")
@@ -623,9 +714,9 @@ class ProtonCLITests(unittest.TestCase):
 
     def test_disconnect_uses_proton_cli(self):
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
-            patch.object(main, "_signed_in", return_value=True),
-            patch.object(main, "_run_cli") as run_cli,
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
+            patch.object(proton_cli, "signed_in", return_value=True),
+            patch.object(proton_cli, "run_cli") as run_cli,
             patch.object(main, "_get_status", return_value={"connected": False}),
         ):
             result = main._disconnect()
@@ -637,7 +728,7 @@ class ProtonCLITests(unittest.TestCase):
 class SignInTests(unittest.TestCase):
     def test_signin_success_is_not_reported_as_failed_authentication(self):
         with (
-            patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")),
+            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")),
             patch.object(main, "_get_status", return_value={"installed": True, "signed_in": True, "connected": None, "error": "status failed"}),
         ):
             result = main._run_cli_signin({"username": "user", "password": "secret", "totp": ""})
@@ -692,7 +783,7 @@ class SignInTests(unittest.TestCase):
         for index in range(4):
             main.SIGNIN_SESSIONS[str(index)] = (bytearray(b"key"), float("inf"))
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
             patch.object(main, "_generate_signin_keypair") as generate,
         ):
             with self.assertRaisesRegex(RuntimeError, "in progress"):
@@ -704,7 +795,7 @@ class SignInTests(unittest.TestCase):
         new_key = bytearray(b"new")
         main.SIGNIN_SESSIONS["expired"] = (old_key, 0)
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
             patch.object(main, "_generate_signin_keypair", return_value=(new_key, "public")),
         ):
             result = main._begin_signin()
@@ -715,7 +806,7 @@ class SignInTests(unittest.TestCase):
 
     def test_generation_is_bounded_and_lock_is_released_on_error(self):
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
             patch.object(main, "_generate_signin_keypair", side_effect=OSError("failure")) as generate,
         ):
             with main.SIGNIN_SESSIONS_LOCK:
@@ -773,8 +864,8 @@ class SignInTests(unittest.TestCase):
             with (
                 self.subTest(code=code),
                 patch.object(main, "_get_status", return_value={"signed_in": True}),
-                patch.object(main, "_cli_environment", return_value={"LC_ALL": "C"}),
-                patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+                patch.object(proton_cli, "cli_environment", return_value={"LC_ALL": "C"}),
+                patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
             ):
                 main._run_cli_signin({"username": "-username", "password": "unique-secret", "totp": code})
                 arguments = run.call_args.args[0]
@@ -792,7 +883,7 @@ class SignInTests(unittest.TestCase):
             ("password", "secret\0"), ("password", 123), ("totp", "code\nextra"),
             ("totp", "code\0"), ("totp", None),
         ]
-        with patch.object(main.subprocess, "run") as run:
+        with patch.object(subprocess, "run") as run:
             for field, value in invalid_fields:
                 with self.subTest(field=field, value=value):
                     credentials = {"username": "user", "password": "secret", "totp": ""}
@@ -810,7 +901,7 @@ class SignInTests(unittest.TestCase):
             OSError(secret),
         ]
         for failure in failures:
-            with self.subTest(failure=type(failure).__name__), patch.object(main.subprocess, "run") as run:
+            with self.subTest(failure=type(failure).__name__), patch.object(subprocess, "run") as run:
                 if isinstance(failure, Exception):
                     run.side_effect = failure
                 else:
@@ -824,15 +915,15 @@ class SignInTests(unittest.TestCase):
 
     def test_status_redacts_cli_error_output(self):
         with (
-            patch.object(main, "_flatpak_installed", return_value=True),
-            patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "private-account", "private-token")),
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
+            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "private-account", "private-token")),
         ):
             result = main._get_status()
         self.assertIn("error", result)
         self.assertNotIn("private", str(result))
 
     def test_ciphertext_validation_precedes_openssl(self):
-        with patch.object(main.subprocess, "run") as run:
+        with patch.object(subprocess, "run") as run:
             for ciphertext in (None, "", "!" * 684, base64.b64encode(b"short").decode()):
                 with self.subTest(ciphertext=ciphertext), self.assertRaises(ValueError):
                     main._decrypt_signin_payload(bytearray(b"key"), ciphertext)
@@ -844,7 +935,7 @@ class SignInTests(unittest.TestCase):
             with (
                 self.subTest(payload=payload),
                 patch.object(main.tempfile, "TemporaryFile", return_value=tempfile.TemporaryFile()),
-                patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(payload).encode(), b"")),
+                patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(payload).encode(), b"")),
             ):
                 with self.assertRaisesRegex(ValueError, "Invalid sign-in request"):
                     main._decrypt_signin_payload(bytearray(b"key"), ciphertext)
