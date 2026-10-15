@@ -10,17 +10,23 @@ Development and backend integration checks were performed on a Steam Deck runnin
 
 - Steam Deck with Decky Loader installed
 - Proton VPN installed from Discover in Desktop Mode
-- A Proton VPN connection created at least once in Desktop Mode
+- Proton CLI signed in at least once in Desktop Mode
 
-The plugin does not install Proton VPN or handle account sign-in. If the app is missing, install it from Discover. If no Proton profile is found, open Proton VPN in Desktop Mode, sign in if needed, and connect once.
+The Proton VPN Flatpak includes the official Linux CLI. The plugin does not install Proton VPN or handle account sign-in. Install the Flatpak from Discover, then close its GUI before using the CLI; Proton does not support running the GUI and CLI concurrently.
+
+For first-time sign-in, open Konsole in Desktop Mode and run `flatpak run --command=protonvpn com.protonvpn.www signin <username>`. Proton CLI handles the password and any 2FA/security-key prompts in its terminal. Decky never receives or stores those secrets.
 
 ## Usage
 
-Open **... > Decky > Proton VPN** in Gaming Mode. The panel shows connection status and saved profiles. It only controls NetworkManager VPN or WireGuard profiles whose names begin with `ProtonVPN` (case-insensitive).
+Open **... > Decky > Proton VPN** in Gaming Mode. The panel shows CLI connection status and an authenticated country selector. Connect, switch, and disconnect actions all go through Proton's own CLI so it can keep its connection and kill-switch state synchronized.
 
-The plugin can select only profiles already created by Proton VPN; it does not fetch Proton's server catalog or create country profiles. It refuses to switch profiles while another Proton profile is active. Disconnect the active profile before connecting a different one.
+The Proton VPN GUI and CLI cannot run at the same time. Close the GUI before using the Decky CLI controls. Proton documents the CLI as terminal-oriented and says headless use is not currently supported, so this Decky integration is experimental.
 
-The NetworkManager connection routes Deck traffic, not only Stremio. This plugin does not provide a kill switch. The backend runs as root because NetworkManager needs elevated access to manage the tunnel; review the code before installing.
+The CLI manages its own authentication persistence through Proton's Linux keyring integration. The plugin does not cache credentials. Steam Deck user accounts normally have no login password, so do not assume locally stored sessions are protected against someone with physical access to the device. Proton CLI sign-out is available with `flatpak run --command=protonvpn com.protonvpn.www signout`; use it when the Deck is shared.
+
+The plugin does not install the Flatpak automatically. Installing applications from Gaming Mode requires package-manager permissions and user confirmation; use Discover in Desktop Mode for this one-time setup.
+
+The VPN applies to Deck traffic generally, not only Stremio.
 
 ## Development on Steam Deck
 
@@ -37,9 +43,9 @@ The VS Code **Decky: Install dependencies**, **Decky: Test**, and **Decky: Build
 ## Manual Gaming Mode Test
 
 1. In Desktop Mode, run `./scripts/decky-dev.sh package`. This builds `out/decky-protonvpn-dev.zip` in Decky's expected ZIP layout.
-2. Run `./scripts/decky-dev.sh serve` in a terminal and leave it running. It serves the ZIP on the Deck's loopback interface at `http://127.0.0.1:8765/decky-protonvpn-dev.zip`.
-3. Switch to Gaming Mode. Open **... > Decky > Settings > General > Manual Plugin Install**, enter that URL, and install.
-4. Open **... > Decky > Proton VPN**. Verify the active profile is shown, toggle it off and back on, then verify Stremio can connect.
-5. Stop the local server with Ctrl+C after Decky has downloaded the ZIP. Rebuild and reinstall after code changes.
+2. In Gaming Mode, open **... > Decky > Settings > General > Manual Plugin Install > Load from ZIP file** and select the ZIP.
+3. If the CLI is signed out, close Proton VPN, sign in from Konsole as described above, then use **Refresh Proton VPN status** in the plugin.
+4. Connect or switch countries from the plugin. Disconnect from the plugin to verify Proton CLI restores networking and clears its kill switch; then verify Stremio can connect.
+5. Rebuild and reinstall the ZIP after code changes.
 
-The server is intentionally bound to `127.0.0.1` and is only for local testing. `out/`, `dist/`, dependencies, and Python caches are ignored by Git; the test ZIP is not committed.
+`out/`, `dist/`, dependencies, and Python caches are ignored by Git; the test ZIP is not committed.

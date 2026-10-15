@@ -61,21 +61,6 @@ package_plugin() {
   printf 'Created %s\n' "$archive"
 }
 
-serve_package() {
-  local archive="$ROOT_DIR/out/decky-protonvpn-dev.zip"
-  local port="${DECKY_DEV_PORT:-8765}"
-  if [[ ! -f "$archive" ]]; then
-    printf 'Package not found. Run: %s package\n' "$0" >&2
-    return 1
-  fi
-
-  printf 'Install URL: http://127.0.0.1:%s/decky-protonvpn-dev.zip\n' "$port"
-  if command -v flatpak-spawn >/dev/null 2>&1; then
-    exec flatpak-spawn --host python3 -m http.server "$port" --bind 127.0.0.1 --directory "$ROOT_DIR/out"
-  fi
-  exec python3 -m http.server "$port" --bind 127.0.0.1 --directory "$ROOT_DIR/out"
-}
-
 command_name="${1:-}"
 if [[ $# -gt 0 ]]; then
   shift
@@ -95,11 +80,8 @@ case "$command_name" in
   package)
     package_plugin
     ;;
-  serve)
-    serve_package
-    ;;
   *)
-    printf 'Usage: %s {install|test|build|package|serve}\n' "$0" >&2
+    printf 'Usage: %s {install|test|build|package}\n' "$0" >&2
     exit 2
     ;;
 esac

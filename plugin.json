@@ -1,7 +1,7 @@
 {
   "name": "Proton VPN",
   "author": "acestronautical",
-  "flags": ["root"],
+  "flags": [],
   "api_version": 1,
   "publish": {
     "tags": ["vpn", "protonvpn", "utility"],

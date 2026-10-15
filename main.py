@@ -1,141 +1,175 @@
 import asyncio
+import os
+import re
 import subprocess
 
 import decky
 
 
 FLATPAK = "/usr/bin/flatpak"
-NMCLI = "/usr/bin/nmcli"
 PROTON_APP_ID = "com.protonvpn.www"
-PROTON_PROFILE_PREFIX = "protonvpn"
-SUPPORTED_CONNECTION_TYPES = {"vpn", "wireguard"}
+PROTON_CLI_COMMAND = [
+    FLATPAK,
+    "run",
+    "--command=protonvpn",
+    PROTON_APP_ID,
+]
+CLI_TIMEOUT_SECONDS = 90
 
 
-def _run_nmcli(arguments: list[str]) -> str:
+def _cli_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    runtime_dir = environment.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    environment.setdefault(
+        "DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime_dir}/bus"
+    )
+    return environment
+
+
+def _run_cli(arguments: list[str]) -> str:
     result = subprocess.run(
-        [NMCLI, "--terse", "--colors", "no", *arguments],
+        [*PROTON_CLI_COMMAND, *arguments],
         capture_output=True,
         check=False,
         stdin=subprocess.DEVNULL,
         text=True,
-        timeout=10,
-        env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        timeout=CLI_TIMEOUT_SECONDS,
+        env=_cli_environment(),
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "NetworkManager command failed")
-    return result.stdout
+        message = (result.stderr or result.stdout).strip()
+        lowered = message.casefold()
+        if "desktop app is currently running" in lowered or "cannot run alongside" in lowered:
+            raise RuntimeError(
+                "Close the Proton VPN desktop app before using the Decky CLI controls"
+            )
+        if "authentication required" in lowered or "please sign in" in lowered:
+            raise RuntimeError("Proton CLI is signed out; sign in from Desktop Mode first")
+        raise RuntimeError(message or "Proton VPN CLI command failed")
+    return result.stdout.strip()
 
 
 def _flatpak_installed() -> bool:
     try:
         result = subprocess.run(
-            [FLATPAK, "info", "--system", "--show-ref", PROTON_APP_ID],
+            [FLATPAK, "info", "--show-ref", PROTON_APP_ID],
             capture_output=True,
             check=False,
             stdin=subprocess.DEVNULL,
             text=True,
             timeout=10,
-            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            env=_cli_environment(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0
 
 
-def _split_nmcli_fields(line: str) -> list[str]:
-    fields = []
-    field = []
-    escaped = False
-    for character in line:
-        if escaped:
-            field.append(character)
-            escaped = False
-        elif character == "\\":
-            escaped = True
-        elif character == ":":
-            fields.append("".join(field))
-            field = []
-        else:
-            field.append(character)
-    if escaped:
-        field.append("\\")
-    fields.append("".join(field))
-    return fields
+def _signed_in() -> bool:
+    output = _run_cli(["info"])
+    account_line = next(
+        (line for line in output.splitlines() if line.startswith("Account:")),
+        "",
+    )
+    account = account_line.partition(":")[2].strip().strip("'\"")
+    return bool(account and account.casefold() != "none")
 
 
-def _proton_profiles() -> list[dict[str, str]]:
-    output = _run_nmcli(["--fields", "UUID,NAME,TYPE", "connection", "show"])
-    profiles = []
+def _parse_status(output: str) -> dict[str, str | bool]:
+    values: dict[str, str | bool] = {
+        "connected": False,
+        "server": "",
+        "protocol": "",
+    }
     for line in output.splitlines():
-        fields = _split_nmcli_fields(line)
-        if len(fields) != 3:
+        label, separator, value = line.partition(":")
+        if not separator:
             continue
-        profile_uuid, name, connection_type = fields
-        if (
-            name.casefold().startswith(PROTON_PROFILE_PREFIX)
-            and connection_type in SUPPORTED_CONNECTION_TYPES
-        ):
-            profiles.append(
-                {"uuid": profile_uuid, "name": name, "type": connection_type}
-            )
-    return profiles
+        key = label.strip().casefold()
+        value = value.strip()
+        if key == "status":
+            values["connected"] = value.casefold() == "connected"
+        elif key == "server":
+            values["server"] = value
+        elif key == "protocol":
+            values["protocol"] = value
+    return values
 
 
-def _active_uuids() -> set[str]:
-    output = _run_nmcli(["--fields", "UUID", "connection", "show", "--active"])
-    return {line.strip() for line in output.splitlines() if line.strip()}
-
-
-def _get_connections() -> dict:
-    installed = _flatpak_installed()
-    if not installed:
-        return {"installed": False, "connected": False, "connections": []}
-
+def _get_status() -> dict:
+    if not _flatpak_installed():
+        return {"installed": False, "signed_in": False, "connected": False}
     try:
-        profiles = _proton_profiles()
-        active = _active_uuids()
+        signed_in = _signed_in()
+        if not signed_in:
+            return {
+                "installed": True,
+                "signed_in": False,
+                "connected": False,
+                "server": "",
+                "protocol": "",
+            }
+        status = _parse_status(_run_cli(["status"]))
+        return {"installed": True, "signed_in": signed_in, **status}
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         return {
             "installed": True,
+            "signed_in": False,
             "connected": False,
-            "connections": [],
+            "server": "",
+            "protocol": "",
             "error": str(error),
         }
 
-    connections = [
-        {**profile, "active": profile["uuid"] in active} for profile in profiles
-    ]
-    return {
-        "installed": True,
-        "connected": any(connection["active"] for connection in connections),
-        "connections": connections,
-    }
+
+def _parse_countries(output: str) -> list[dict[str, str]]:
+    countries = []
+    for line in output.splitlines():
+        match = re.match(r"^\s*(.+?)\s{2,}([A-Z]{2})\s*$", line)
+        if not match:
+            continue
+        name, country_code = match.groups()
+        if name.casefold() != "country":
+            countries.append({"name": name.strip(), "code": country_code})
+    return countries
 
 
-def _toggle_connection(profile_uuid: str) -> dict:
-    if not isinstance(profile_uuid, str):
-        raise ValueError("Invalid Proton VPN profile")
+def _get_countries() -> dict:
     if not _flatpak_installed():
-        raise RuntimeError("Install Proton VPN from Discover in Desktop Mode first")
-
-    profiles = _proton_profiles()
-    profile = next((item for item in profiles if item["uuid"] == profile_uuid), None)
-    if profile is None:
-        raise ValueError("That Proton VPN profile is not available")
-
-    active = _active_uuids()
-    if profile_uuid in active:
-        _run_nmcli(["connection", "down", "uuid", profile_uuid])
-    else:
-        active_proton_uuids = {
-            item["uuid"] for item in profiles if item["uuid"] in active
+        return {"signed_in": False, "countries": []}
+    try:
+        if not _signed_in():
+            return {"signed_in": False, "countries": []}
+        return {
+            "signed_in": True,
+            "countries": _parse_countries(_run_cli(["countries", "list"])),
         }
-        if active_proton_uuids:
-            raise RuntimeError(
-                "Disconnect the active Proton VPN connection before switching servers"
-            )
-        _run_nmcli(["connection", "up", "uuid", profile_uuid])
-    return _get_connections()
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        return {"signed_in": False, "countries": [], "error": str(error)}
+
+
+def _connect_country(country_code: str) -> dict:
+    if not isinstance(country_code, str) or not re.fullmatch(r"[A-Z]{2}", country_code):
+        raise ValueError("Choose a valid Proton VPN country")
+    country_data = _get_countries()
+    if country_data.get("error"):
+        raise RuntimeError(country_data["error"])
+    if not country_data["signed_in"]:
+        raise RuntimeError("Sign in to the Proton VPN CLI from Desktop Mode first")
+    if country_code not in {country["code"] for country in country_data["countries"]}:
+        raise ValueError("That country is not in Proton VPN's available country list")
+    _run_cli(["connect", "--country", country_code])
+    return _get_status()
+
+
+def _disconnect() -> dict:
+    if not _flatpak_installed():
+        raise RuntimeError("Proton VPN is not installed")
+    if not _signed_in():
+        raise RuntimeError("Sign in to the Proton VPN CLI from Desktop Mode first")
+    _run_cli(["disconnect"])
+    return _get_status()
 
 
 class Plugin:
@@ -145,8 +179,14 @@ class Plugin:
     async def _unload(self):
         decky.logger.info("Proton VPN Decky plugin unloaded")
 
-    async def get_connections(self) -> dict:
-        return await asyncio.to_thread(_get_connections)
+    async def get_status(self) -> dict:
+        return await asyncio.to_thread(_get_status)
 
-    async def toggle_connection(self, profile_uuid: str) -> dict:
-        return await asyncio.to_thread(_toggle_connection, profile_uuid)
+    async def get_countries(self) -> dict:
+        return await asyncio.to_thread(_get_countries)
+
+    async def connect_country(self, country_code: str) -> dict:
+        return await asyncio.to_thread(_connect_country, country_code)
+
+    async def disconnect(self) -> dict:
+        return await asyncio.to_thread(_disconnect)

@@ -8,98 +8,133 @@ sys.modules.setdefault("decky", types.ModuleType("decky"))
 import main
 
 
-PROFILE = {
-    "uuid": "proton-uuid",
-    "name": "ProtonVPN US-CA#879",
-    "type": "wireguard",
-}
+class ProtonCLITests(unittest.TestCase):
+    def test_parse_status_extracts_connection_details(self):
+        status = main._parse_status(
+            "Status: Connected\nServer: US-CA#856 in San Jose, United States\n"
+            "Load: 48%\nProtocol: wireguard"
+        )
+        self.assertEqual(
+            status,
+            {
+                "connected": True,
+                "server": "US-CA#856 in San Jose, United States",
+                "protocol": "wireguard",
+            },
+        )
 
+    def test_parse_countries_skips_heading_and_parses_names(self):
+        countries = main._parse_countries(
+            "Country                           Code\n"
+            "--------------------------------  ------\n"
+            "Canada                            CA\n"
+            "United States                     US\n"
+        )
+        self.assertEqual(
+            countries,
+            [
+                {"name": "Canada", "code": "CA"},
+                {"name": "United States", "code": "US"},
+            ],
+        )
 
-class ProtonBackendTests(unittest.TestCase):
-    def test_split_nmcli_fields_handles_escaped_colons(self):
-        fields = main._split_nmcli_fields(r"proton-uuid:ProtonVPN US\:CA#879:wireguard")
-        self.assertEqual(fields, ["proton-uuid", "ProtonVPN US:CA#879", "wireguard"])
-
-    def test_get_connections_reports_active_proton_profile(self):
+    def test_status_does_not_return_account_name(self):
         with (
             patch.object(main, "_flatpak_installed", return_value=True),
             patch.object(
                 main,
-                "_run_nmcli",
+                "_run_cli",
                 side_effect=[
-                    "proton-uuid:ProtonVPN US-CA#879:wireguard\n",
-                    "proton-uuid\n",
+                    "Account: 'user@example.com'",
+                    "Status: Connected\nServer: US-CA#856\nProtocol: wireguard",
                 ],
             ),
         ):
-            status = main._get_connections()
+            status = main._get_status()
 
-        self.assertTrue(status["installed"])
+        self.assertTrue(status["signed_in"])
         self.assertTrue(status["connected"])
-        self.assertEqual(status["connections"], [{**PROFILE, "active": True}])
+        self.assertNotIn("user@example.com", str(status))
+
+    def test_status_detects_cli_signed_out(self):
+        with (
+            patch.object(main, "_flatpak_installed", return_value=True),
+            patch.object(
+                main,
+                "_run_cli",
+                side_effect=["Account: 'None'", "Status: Disconnected"],
+            ),
+        ):
+            status = main._get_status()
+
+        self.assertFalse(status["signed_in"])
+        self.assertFalse(status["connected"])
 
     def test_missing_app_returns_install_guidance_state(self):
         with (
             patch.object(main, "_flatpak_installed", return_value=False),
-            patch.object(main, "_run_nmcli") as run_nmcli,
+            patch.object(main, "_run_cli") as run_cli,
         ):
-            status = main._get_connections()
+            status = main._get_status()
 
         self.assertFalse(status["installed"])
-        self.assertEqual(status["connections"], [])
-        run_nmcli.assert_not_called()
+        run_cli.assert_not_called()
 
-    def test_toggle_disconnects_active_profile_by_uuid(self):
+    def test_get_countries_uses_proton_cli(self):
         with (
             patch.object(main, "_flatpak_installed", return_value=True),
-            patch.object(main, "_proton_profiles", return_value=[PROFILE]),
-            patch.object(main, "_active_uuids", return_value={"proton-uuid"}),
-            patch.object(main, "_run_nmcli") as run_nmcli,
-            patch.object(main, "_get_connections", return_value={"connected": False}),
+            patch.object(main, "_signed_in", return_value=True),
+            patch.object(
+                main,
+                "_run_cli",
+                return_value="Country  Code\nCanada   CA\nUnited States US",
+            ) as run_cli,
         ):
-            main._toggle_connection("proton-uuid")
+            result = main._get_countries()
 
-        run_nmcli.assert_called_once_with(
-            ["connection", "down", "uuid", "proton-uuid"]
-        )
+        run_cli.assert_called_once_with(["countries", "list"])
+        self.assertEqual(result["countries"][0], {"name": "Canada", "code": "CA"})
 
-    def test_toggle_connects_inactive_profile_by_uuid(self):
+    def test_connect_country_validates_then_calls_cli(self):
+        with (
+            patch.object(
+                main,
+                "_get_countries",
+                return_value={"signed_in": True, "countries": [{"name": "Canada", "code": "CA"}]},
+            ),
+            patch.object(main, "_run_cli") as run_cli,
+            patch.object(main, "_get_status", return_value={"connected": True}),
+        ):
+            result = main._connect_country("CA")
+
+        run_cli.assert_called_once_with(["connect", "--country", "CA"])
+        self.assertTrue(result["connected"])
+
+    def test_connect_country_rejects_unknown_code(self):
+        with (
+            patch.object(
+                main,
+                "_get_countries",
+                return_value={"signed_in": True, "countries": [{"name": "Canada", "code": "CA"}]},
+            ),
+            patch.object(main, "_run_cli") as run_cli,
+        ):
+            with self.assertRaisesRegex(ValueError, "available country list"):
+                main._connect_country("US")
+
+        run_cli.assert_not_called()
+
+    def test_disconnect_uses_proton_cli(self):
         with (
             patch.object(main, "_flatpak_installed", return_value=True),
-            patch.object(main, "_proton_profiles", return_value=[PROFILE]),
-            patch.object(main, "_active_uuids", return_value=set()),
-            patch.object(main, "_run_nmcli") as run_nmcli,
-            patch.object(main, "_get_connections", return_value={"connected": True}),
+            patch.object(main, "_signed_in", return_value=True),
+            patch.object(main, "_run_cli") as run_cli,
+            patch.object(main, "_get_status", return_value={"connected": False}),
         ):
-            main._toggle_connection("proton-uuid")
+            result = main._disconnect()
 
-        run_nmcli.assert_called_once_with(
-            ["connection", "up", "uuid", "proton-uuid"]
-        )
-
-    def test_toggle_refuses_to_switch_while_another_profile_is_active(self):
-        other_profile = {**PROFILE, "uuid": "other-proton-uuid"}
-        with (
-            patch.object(main, "_flatpak_installed", return_value=True),
-            patch.object(main, "_proton_profiles", return_value=[PROFILE, other_profile]),
-            patch.object(main, "_active_uuids", return_value={"other-proton-uuid"}),
-            patch.object(main, "_run_nmcli") as run_nmcli,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "Disconnect the active Proton VPN"):
-                main._toggle_connection("proton-uuid")
-
-        run_nmcli.assert_not_called()
-
-    def test_toggle_rejects_unknown_profile(self):
-        with (
-            patch.object(main, "_flatpak_installed", return_value=True),
-            patch.object(main, "_proton_profiles", return_value=[PROFILE]),
-            patch.object(main, "_run_nmcli") as run_nmcli,
-        ):
-            with self.assertRaisesRegex(ValueError, "not available"):
-                main._toggle_connection("unknown-uuid")
-
-        run_nmcli.assert_not_called()
+        run_cli.assert_called_once_with(["disconnect"])
+        self.assertFalse(result["connected"])
 
 
 if __name__ == "__main__":
