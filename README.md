@@ -49,6 +49,8 @@ Viewing **Connection**, including its error-only **Retry**, runs only a bounded 
 
 Opening **Settings** or **Account** lazily reads account state and the exposed settings in one guarded Flatpak process. Rapid tab changes share the in-flight request. This read avoids the normal Proton `status` command and its server-list refresh. Connect, switch, disconnect, sign-in/out, and setting changes still invoke Proton explicitly. Actions remain blocked during an outstanding account/settings read. Errors expose **Retry** and optional diagnostic details; there is no normal debug refresh button.
 
+When signed in, **Account** displays the validated username from Proton's current authenticated session above **Sign out**. This name is returned to the UI through the guarded account snapshot, not taken from the cached sign-in input. It clears on sign-out; an unavailable name is shown as unavailable without exposing credential records or blocking account controls.
+
 - **Quick connect** uses Proton's fastest-server selection with no country argument. Choose a country under **Location** for a specific destination; while connected, **Switch server** applies that selection.
 - **Disconnect** is the primary action while connected.
 - **Kill switch** reflects Proton's actual `off` or `standard` setting, not a cached preference. Proton requires disconnection before changes: the toggle is disabled while connected or tunnel state is unknown. The plugin never disconnects automatically to change this setting. Disabling it requires confirmation. Standard mode blocks traffic after an unexpected VPN drop, but restores internet after intentional disconnection. A changed setting is read back before the toggle updates.

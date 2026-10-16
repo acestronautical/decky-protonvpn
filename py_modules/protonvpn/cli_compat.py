@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
 import runpy
 import sys
 
@@ -104,9 +105,15 @@ def install_disconnect_cleanup_fix(server) -> bool:
 
 
 async def read_panel_snapshot(controller, features) -> dict:
-    result = {"signed_in": bool(controller.is_logged_in)}
+    result = {"signed_in": bool(controller.is_logged_in), "account_name": None}
     if not result["signed_in"]:
         return result
+    try:
+        account_name = controller.account_name
+        if isinstance(account_name, str) and re.fullmatch(r"[A-Za-z0-9._+@-]{1,254}", account_name):
+            result["account_name"] = account_name
+    except Exception:
+        pass
     settings = {}
     requires_upgrade = []
     try:

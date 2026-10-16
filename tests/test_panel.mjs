@@ -12,7 +12,7 @@ const compiled = ts.transpileModule(readFileSync(new URL("../src/index.tsx", imp
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true },
 }).outputText;
 
-function panelHarness({ detailsGate, actionGate } = {}) {
+function panelHarness({ detailsGate, actionGate, cachedName = "" } = {}) {
   const calls = [];
   const modals = [];
   let killSwitch = false;
@@ -57,7 +57,7 @@ function panelHarness({ detailsGate, actionGate } = {}) {
     "react-icons/fa": Object.fromEntries([
       "FaBolt", "FaExchangeAlt", "FaPowerOff", "FaSignOutAlt", "FaSlidersH", "FaSyncAlt", "FaUser",
     ].map(name => [name, () => null])),
-    "./signin": { cachedUsername: () => "", rememberUsername: () => {}, encodeSignIn: () => new Uint8Array(3), encryptSignIn: async () => "test-ciphertext" },
+    "./signin": { cachedUsername: () => cachedName, rememberUsername: () => {}, encodeSignIn: () => new Uint8Array(3), encryptSignIn: async () => "test-ciphertext" },
     "../protonvpn-dark.png": "protonvpn.png",
     "../py_modules/protonvpn/countries.json": JSON.parse(readFileSync(new URL("../py_modules/protonvpn/countries.json", import.meta.url), "utf8")),
   };
@@ -185,18 +185,41 @@ test("submitted sign-in remains coordinated across panel remounts", async () => 
   panel.close();
 });
 
-test("tabs use labeled icons and inherit the available panel height", async () => {
+test("tabs use compact labeled icons and the fixed MagicPods container", async () => {
   const panel = panelHarness();
   await panel.open();
   assert.deepEqual(Array.from(panel.tabs(), tab => tab.title.props["aria-label"]), ["Connection", "Settings", "Account"]);
   for (const tab of panel.tabs()) {
     assert.equal(tab.title.props.title, tab.title.props["aria-label"]);
-    assert.equal(tab.title.props.children.props.size, 20);
-    assert.equal(tab.title.props.children.props["aria-hidden"], "true");
+    assert.equal(tab.title.props.size, 18);
+    assert.equal(tab.title.props.role, "img");
+    assert.equal(tab.title.props.style.display, "block");
+    assert.equal(tab.title.props.children, undefined);
   }
-  assert.equal(panel.frame().props.style.height, "100%");
-  assert.equal(panel.frame().props.style.minHeight, 0);
+  assert.equal(panel.frame().props.style.position, "fixed");
+  assert.equal(panel.frame().props.style.height, "95%");
+  assert.equal(panel.frame().props.style.width, "300px");
+  assert.equal(panel.frame().props.style.marginTop, "-12px");
+  assert.equal(panel.frame().props.style.overflow, "hidden");
   assert.deepEqual(panel.calls, [["get_connection_status"]]);
+  panel.close();
+});
+
+test("Account shows verified identity, clears it on sign-out, and never substitutes the cached username", async () => {
+  const panel = panelHarness({ cachedName: "other-cached-user" });
+  panel.setStatus({ installed: true, signed_in: true, account_name: "verified-user@example.com", connected: false, tunnel_active: false });
+  await panel.open();
+  assert.equal(panel.frame().findAllByProps({ "aria-label": "Signed-in account" }).length, 0);
+  assert.deepEqual(panel.calls, [["get_connection_status"]]);
+  await panel.tab("account");
+  assert.equal(panel.frame().findByProps({ "aria-label": "Signed-in account" }).children.join(""), "verified-user@example.com");
+  act(() => panel.button("Sign out").props.onClick());
+  await act(async () => panel.modals[0].props.onOK());
+  assert.equal(panel.frame().findAllByProps({ "aria-label": "Signed-in account" }).length, 0);
+  panel.setStatus({ installed: true, signed_in: true, connected: false, tunnel_active: false });
+  await panel.tab("connection");
+  await panel.tab("account");
+  assert.equal(panel.frame().findByProps({ "aria-label": "Signed-in account" }).children.join(""), "Account name unavailable");
   panel.close();
 });
 

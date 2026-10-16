@@ -40,7 +40,9 @@ def panel_snapshot() -> dict:
             raise ValueError()
         mode = settings.get("kill-switch")
         result["kill_switch"] = mode == "standard" if mode is not None else None
-        return {name: result[name] for name in ("signed_in", "settings", "settings_error", "requires_upgrade", "requires_reconnect", "kill_switch") if name in result}
+        account_name = result.get("account_name")
+        result["account_name"] = account_name if result["signed_in"] and isinstance(account_name, str) and re.fullmatch(r"[A-Za-z0-9._+@-]{1,254}", account_name) else None
+        return {name: result[name] for name in ("signed_in", "account_name", "settings", "settings_error", "requires_upgrade", "requires_reconnect", "kill_switch") if name in result}
     except (ValueError, TypeError):
         raise RuntimeError("Proton returned an unsupported panel snapshot") from None
 

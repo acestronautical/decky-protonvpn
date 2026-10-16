@@ -198,7 +198,7 @@ class ReliabilityTests(unittest.TestCase):
 
 class PanelSnapshotTests(unittest.IsolatedAsyncioTestCase):
     async def test_snapshot_reads_metadata_and_settings_without_server_lookup(self):
-        controller = Mock(is_logged_in=True, user_on_free_tier=False)
+        controller = Mock(is_logged_in=True, user_on_free_tier=False, account_name="verified-user")
 
         async def setting(feature):
             return "standard"
@@ -207,6 +207,7 @@ class PanelSnapshotTests(unittest.IsolatedAsyncioTestCase):
         feature = types.SimpleNamespace(command="kill-switch", available_on_free_tier=True, click_type=types.SimpleNamespace(to_str=str))
         result = await cli_compat.read_panel_snapshot(controller, [feature])
         self.assertEqual(result["settings"], {"kill-switch": "standard"})
+        self.assertEqual(result["account_name"], "verified-user")
         self.assertNotIn("connected", result)
         controller.get_updated_server_list.assert_not_called()
         controller.get_vpn_connector.assert_not_called()
@@ -221,8 +222,39 @@ class PanelSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["requires_upgrade"], ["netshield"])
         controller.get_feature_setting.assert_not_called()
         controller.is_logged_in = False
-        self.assertFalse((await cli_compat.read_panel_snapshot(controller, [feature]))["signed_in"])
+        signed_out = await cli_compat.read_panel_snapshot(controller, [feature])
+        self.assertFalse(signed_out["signed_in"])
+        self.assertIsNone(signed_out["account_name"])
         controller.get_vpn_connector.assert_not_called()
+
+    async def test_unavailable_account_name_does_not_break_snapshot_or_expose_details(self):
+        class Controller:
+            is_logged_in = True
+
+            @property
+            def account_name(self):
+                raise RuntimeError("private-data")
+
+        result = await cli_compat.read_panel_snapshot(Controller(), [])
+        self.assertTrue(result["signed_in"])
+        self.assertIsNone(result["account_name"])
+        self.assertEqual(result["settings"], {})
+        self.assertNotIn("private-data", str(result))
+
+    async def test_signed_out_snapshot_does_not_read_account_name(self):
+        reads = []
+
+        class Controller:
+            is_logged_in = False
+
+            @property
+            def account_name(self):
+                reads.append(True)
+                return "previous-user"
+
+        result = await cli_compat.read_panel_snapshot(Controller(), [])
+        self.assertIsNone(result["account_name"])
+        self.assertEqual(reads, [])
 
     async def test_settings_failure_preserves_auth_without_exposing_details(self):
         controller = Mock(is_logged_in=True, user_on_free_tier=False)
@@ -240,6 +272,21 @@ class PanelSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConnectionSnapshotTests(unittest.TestCase):
+    def test_snapshot_returns_only_valid_authenticated_account_name(self):
+        for signed_in, name, expected in (
+            (True, "verified-user@example.com", "verified-user@example.com"),
+            (False, "previous-user", None),
+            (True, None, None),
+            (True, {"token": "private-data"}, None),
+            (True, "bad\nname", None),
+            (True, "a" * 255, None),
+        ):
+            payload = {"signed_in": signed_in, "account_name": name, "credentials": "private-data"}
+            with self.subTest(signed_in=signed_in, expected=expected), patch.object(proton_cli, "run_cli", return_value=json.dumps(payload)):
+                result = proton_cli.panel_snapshot()
+            self.assertEqual(result["account_name"], expected)
+            self.assertNotIn("private-data", str(result))
+
     def test_account_status_rpc_returns_busy_without_reading_or_throwing(self):
         with main.CLI_OPERATION_LOCK, patch.object(main, "_get_status") as status:
             result = asyncio.run(main.Plugin().get_status())

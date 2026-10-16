@@ -26,6 +26,7 @@ type ProtonCountry = {
 type ProtonStatus = {
   installed: boolean | null;
   signed_in: boolean | null;
+  account_name?: string | null;
   connected: boolean | null;
   tunnel_active?: boolean | null;
   server?: string;
@@ -169,7 +170,7 @@ function Content() {
   } | undefined>(undefined);
 
   const applyResult = (result: ConnectionStatus | ProtonStatus) => {
-    setStatus((previous) => ({ installed: null, signed_in: null, ...previous, ...result, error: result.error, notice: "notice" in result ? result.notice : undefined }));
+    setStatus((previous) => ({ installed: null, signed_in: null, ...previous, ...result, account_name: "installed" in result ? result.signed_in === true ? result.account_name ?? null : null : previous?.account_name, error: result.error, notice: "notice" in result ? result.notice : undefined }));
     setError(result.error ?? ("settings_error" in result ? result.settings_error : undefined));
     if ("kill_switch" in result) setKillSwitchValue(result.kill_switch ?? null);
   };
@@ -431,9 +432,16 @@ function Content() {
   const accountView = <>
     {loadingSettings && <PanelSection><PanelSectionRow>Checking account...</PanelSectionRow></PanelSection>}
     {status?.installed === false && <PanelSection><PanelSectionRow>Install Proton VPN from Discover in Desktop Mode.</PanelSectionRow></PanelSection>}
-    {status?.signed_in && <PanelSection title="Account"><PanelSectionRow>
-      <DialogButton style={actionStyle} disabled={blocked || !!error} onClick={confirmSignOut}><FaSignOutAlt /> Sign out</DialogButton>
-    </PanelSectionRow></PanelSection>}
+    {status?.signed_in && <PanelSection title="Account">
+      <PanelSectionRow>
+        <div aria-label="Signed-in account" style={{ fontSize: 14, overflowWrap: "anywhere", minWidth: 0, paddingBottom: 8 }}>
+          {status.account_name ?? "Account name unavailable"}
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <DialogButton style={actionStyle} disabled={blocked || !!error} onClick={confirmSignOut}><FaSignOutAlt /> Sign out</DialogButton>
+      </PanelSectionRow>
+    </PanelSection>}
 
       {status?.installed && status.signed_in === false && !status.error && (
         <PanelSection title="Sign in">
@@ -484,12 +492,12 @@ function Content() {
   </>;
 
   return (
-    <div className="protonvpn-tabs" style={{ height: "100%", minHeight: 0, maxWidth: "100%" }}>
-      <style>{`.protonvpn-tabs [role="tabpanel"] { min-height: 0; overflow-y: auto; scroll-padding-block: 8px; }`}</style>
+    <div className="protonvpn-tabs" style={{ position: "fixed", height: "95%", width: "300px", maxWidth: "100%", marginTop: "-12px", overflow: "hidden" }}>
+      <style>{`.protonvpn-tabs [role="tabpanel"] { min-height: 0; padding-left: 8px !important; padding-right: 8px !important; overflow-y: auto; scroll-padding-block: 8px; }`}</style>
       <Tabs activeTab={activeTab} onShowTab={changeTab} tabs={[
-        { id: "connection", title: <span role="img" aria-label="Connection" title="Connection"><FaExchangeAlt size={20} aria-hidden="true" style={{ display: "block" }} /></span>, content: connectionView },
-        { id: "settings", title: <span role="img" aria-label="Settings" title="Settings"><FaSlidersH size={20} aria-hidden="true" style={{ display: "block" }} /></span>, content: settingsView },
-        { id: "account", title: <span role="img" aria-label="Account" title="Account"><FaUser size={20} aria-hidden="true" style={{ display: "block" }} /></span>, content: accountView },
+        { id: "connection", title: <FaExchangeAlt size={18} role="img" aria-label="Connection" title="Connection" style={{ display: "block" }} />, content: connectionView },
+        { id: "settings", title: <FaSlidersH size={18} role="img" aria-label="Settings" title="Settings" style={{ display: "block" }} />, content: settingsView },
+        { id: "account", title: <FaUser size={18} role="img" aria-label="Account" title="Account" style={{ display: "block" }} />, content: accountView },
       ]} />
     </div>
   );
