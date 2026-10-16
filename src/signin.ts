@@ -1,3 +1,23 @@
+const usernameStorageKey = "decky-protonvpn.username";
+
+export function cachedUsername(): string {
+  try {
+    const username = globalThis.localStorage.getItem(usernameStorageKey) ?? "";
+    return /^[A-Za-z0-9._+@-]{1,254}$/.test(username) ? username : "";
+  } catch {
+    return "";
+  }
+}
+
+export function rememberUsername(username: string): void {
+  if (!/^[A-Za-z0-9._+@-]{1,254}$/.test(username)) return;
+  try {
+    globalThis.localStorage.setItem(usernameStorageKey, username);
+  } catch {
+    return;
+  }
+}
+
 export function encodeSignIn(credentials: {
   username: string;
   password: string;
@@ -43,10 +63,13 @@ export async function encryptSignIn(
       false,
       ["encrypt"],
     );
+    if (!(plaintext.buffer instanceof ArrayBuffer)) {
+      throw new Error("Secure sign-in requires a non-shared buffer");
+    }
     const encrypted = await crypto.subtle.encrypt(
       { name: "RSA-OAEP" },
       publicKey,
-      plaintext,
+      new Uint8Array(plaintext.buffer, plaintext.byteOffset, plaintext.byteLength),
     );
     return btoa(String.fromCharCode(...new Uint8Array(encrypted)));
   } finally {

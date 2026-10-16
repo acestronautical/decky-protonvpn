@@ -270,15 +270,11 @@ def _start_keyring_service() -> dict:
 
 
 def _get_status() -> dict:
-    tunnel_active = proton_cli.tunnel_active()
     result = _get_cli_status()
-    result["tunnel_active"] = tunnel_active
-    if tunnel_active is not None and result.get("connected") is not tunnel_active:
-        result["connected"] = None
-        if tunnel_active:
-            result.setdefault("error", "A Proton VPN tunnel is active, but Proton CLI status is unavailable or inconsistent. No connection was changed.")
-        elif result.get("signed_in") is True and not result.get("error"):
-            result["error"] = "Proton CLI reports a connection, but NetworkManager has no active Proton tunnel."
+    connection = proton_cli.connection_status()
+    if connection.get("error"):
+        result.setdefault("error", connection["error"])
+    result.update({name: value for name, value in connection.items() if name != "error"})
     return result
 
 
@@ -290,17 +286,7 @@ def _get_cli_status() -> dict:
         if not installed:
             return {"installed": False, "signed_in": False, "connected": False}
         keyring.ensure_service()
-        signed_in = proton_cli.signed_in()
-        if not signed_in:
-            return {
-                "installed": True,
-                "signed_in": False,
-                "connected": None,
-                "server": "",
-                "protocol": "",
-            }
-        status = proton_cli.parse_status(proton_cli.run_cli(["status"]))
-        return {"installed": True, "signed_in": signed_in, **status}
+        return {"installed": True, **proton_cli.panel_snapshot()}
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         result = {
             "installed": installed,
@@ -325,31 +311,16 @@ def _get_cli_status() -> dict:
 
 
 def _get_countries() -> dict:
-    try:
-        if not proton_cli.flatpak_installed():
-            return {"signed_in": False, "countries": []}
-        keyring.ensure_service()
-        if not proton_cli.signed_in():
-            return {"signed_in": False, "countries": []}
-        return {
-            "signed_in": True,
-            "countries": proton_cli.parse_countries(proton_cli.run_cli(["countries", "list"])),
-        }
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-        return {"signed_in": False, "countries": [], "error": str(error)}
+    return {"countries": [{"code": code, "name": name} for code, name in proton_cli.COUNTRIES.items()]}
 
 
 def _connect_country(country_code: str) -> dict:
     if not isinstance(country_code, str) or not re.fullmatch(r"[A-Z]{2}", country_code):
         raise ValueError("Choose a valid Proton VPN country")
     country_data = _get_countries()
-    if country_data.get("error"):
-        raise RuntimeError(country_data["error"])
-    if not country_data["signed_in"]:
-        raise RuntimeError("Sign in to the Proton VPN CLI from Desktop Mode first")
     if country_code not in {country["code"] for country in country_data["countries"]}:
         raise ValueError("That country is not in Proton VPN's available country list")
-    keyring.ensure_service()
+    _require_account()
     proton_cli.run_cli(["connect", "--country", country_code])
     return _get_status()
 
@@ -364,8 +335,86 @@ def _disconnect() -> dict:
     return _get_status()
 
 
+def _require_account() -> None:
+    if not proton_cli.flatpak_installed():
+        raise RuntimeError("Proton VPN is not installed")
+    keyring.ensure_service()
+    if not proton_cli.signed_in():
+        raise RuntimeError("Sign in to Proton VPN first")
+
+
+def _quick_connect() -> dict:
+    _require_account()
+    proton_cli.run_cli(["connect"])
+    return _get_status()
+
+
+def _get_settings() -> dict:
+    _require_account()
+    output = proton_cli.run_cli(["config", "list"])
+    setting = re.search(r"^\s*kill-switch\s+(off|standard)\s*$", output, re.MULTILINE)
+    if setting is None:
+        return {"kill_switch": None, "error": "Proton did not report a supported kill-switch setting"}
+    return {"kill_switch": setting.group(1) == "standard"}
+
+
+def _set_kill_switch(enabled: bool) -> dict:
+    if type(enabled) is not bool:
+        raise ValueError("Choose a valid kill-switch setting")
+    _require_account()
+    active = proton_cli.tunnel_active()
+    if active is None:
+        raise RuntimeError("Cannot verify tunnel state; kill-switch setting was not changed")
+    if active:
+        raise RuntimeError("Disconnect the VPN before changing the kill switch")
+    proton_cli.run_cli(["config", "set", "kill-switch", "standard" if enabled else "off"])
+    setting = _get_settings()
+    result = _get_status()
+    result.update(setting)
+    if setting.get("kill_switch") is not enabled:
+        result["error"] = setting.get("error", "Proton did not confirm the requested kill-switch setting")
+    return result
+
+
+def _set_feature(name: str, value: str) -> dict:
+    if not isinstance(name, str) or name == "kill-switch" or name not in proton_cli.SETTING_VALUES:
+        raise ValueError("Choose a supported VPN setting")
+    if not isinstance(value, str) or value not in proton_cli.SETTING_VALUES[name]:
+        raise ValueError("Choose a supported setting value")
+    _require_account()
+    proton_cli.run_cli(["config", "set", name, value])
+    result = _get_status()
+    if result.get("settings", {}).get(name) != value:
+        result.setdefault("error", "Proton did not confirm the requested setting")
+    elif result.get("connected") and name in result.get("requires_reconnect", []):
+        result["notice"] = "Setting saved; reconnect to apply it"
+    return result
+
+
+def _signout() -> dict:
+    _require_account()
+    active = proton_cli.tunnel_active()
+    if active is None:
+        raise RuntimeError("Cannot verify tunnel state; sign-out was not attempted")
+    if active:
+        result = _disconnect()
+        if result.get("error") or result.get("tunnel_active") is not False:
+            raise RuntimeError("Disconnect could not be verified; sign-out was not attempted")
+    proton_cli.run_cli(["signout"])
+    result = _get_status()
+    if result.get("signed_in") is not False or result.get("tunnel_active") is not False:
+        result["error"] = "Proton sign-out could not be verified; check account and tunnel status"
+    return result
+
+
 class Plugin:
     _cleanup_task: asyncio.Task | None = None
+
+    async def get_connection_status(self) -> dict:
+        return await asyncio.to_thread(proton_cli.connection_status)
+
+    async def set_feature(self, name: str, value: str) -> dict:
+        return await asyncio.to_thread(_status_result, _cli_operation, _set_feature, name, value)
 
     async def _expire_sessions(self):
         while True:
@@ -418,3 +467,18 @@ class Plugin:
 
     async def disconnect(self) -> dict:
         return await asyncio.to_thread(_status_result, _cli_operation, _disconnect)
+
+    async def quick_connect(self) -> dict:
+        return await asyncio.to_thread(_status_result, _cli_operation, _quick_connect)
+
+    async def get_settings(self) -> dict:
+        try:
+            return await asyncio.to_thread(_cli_operation, _get_settings)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            return {"kill_switch": None, "error": str(error)}
+
+    async def set_kill_switch(self, enabled: bool) -> dict:
+        return await asyncio.to_thread(_status_result, _cli_operation, _set_kill_switch, enabled)
+
+    async def signout(self) -> dict:
+        return await asyncio.to_thread(_status_result, _cli_operation, _signout)

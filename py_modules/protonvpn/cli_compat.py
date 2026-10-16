@@ -103,12 +103,50 @@ def install_disconnect_cleanup_fix(server) -> bool:
     return True
 
 
+async def read_panel_snapshot(controller, features) -> dict:
+    result = {"signed_in": bool(controller.is_logged_in)}
+    if not result["signed_in"]:
+        return result
+    settings = {}
+    requires_upgrade = []
+    try:
+        for feature in features:
+            if not feature.available_on_free_tier and controller.user_on_free_tier:
+                settings[feature.command] = None
+                requires_upgrade.append(feature.command)
+            else:
+                value = await controller.get_feature_setting(feature)
+                settings[feature.command] = feature.click_type.to_str(value)
+        result["settings"] = settings
+        result["requires_upgrade"] = requires_upgrade
+        result["requires_reconnect"] = [feature.command for feature in features if getattr(feature, "requires_restart", False)]
+    except Exception:
+        result["settings_error"] = "Proton settings could not be read"
+    return result
+
+
+def install_panel_snapshot(account, features) -> None:
+    async def snapshot(ctx):
+        controller = await account.Controller.create(params=ctx.obj, click_ctx=ctx)
+        print(json.dumps(await read_panel_snapshot(controller, features)))
+
+    account.info.callback = account.click.pass_context(account.run_async(snapshot))
+
+
 def main() -> None:
     from proton.keyring_linux.secretservice import secretservice_backend
 
     if not install_keyring_read_fix(secretservice_backend):
         raise RuntimeError("Unsupported Proton keyring implementation; no CLI command was run")
-    if sys.argv[1:2] in (["connect"], ["disconnect"]):
+    if sys.argv[1:] == ["panel-snapshot"]:
+        from proton.vpn.cli.commands import account, feature_setting_definitions as features
+
+        install_panel_snapshot(account, (
+            features.KILLSWITCH_FEATURE, features.NETSHIELD_FEATURE,
+            features.VPN_ACCELERATOR_FEATURE, features.MODERATE_NAT_FEATURE,
+        ))
+        sys.argv[1:] = ["info"]
+    if sys.argv[1:2] in (["connect"], ["disconnect"], ["signout"]) or sys.argv[1:3] == ["config", "set"]:
         from proton.vpn.backend.networkmanager.killswitch.wireguard.nmclient import NMClient, NM
 
         install_route_snapshot_fix(NMClient, NM)

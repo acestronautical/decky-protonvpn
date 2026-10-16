@@ -6,7 +6,7 @@
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
-    "test": "python3 -m unittest discover -s tests && node --test tests/test_signin.mjs"
+    "test": "python3 -m unittest discover -s tests && node --test tests/test_signin.mjs tests/test_panel.mjs"
   },
   "repository": {
     "type": "git",
@@ -33,6 +33,7 @@
     "@types/react": "19.1.1",
     "@types/react-dom": "19.1.1",
     "@types/webpack": "^5.28.5",
+    "react-test-renderer": "18.3.1",
     "rollup": "^4.53.3",
     "typescript": "^5.6.2"
   },

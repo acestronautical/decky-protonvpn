@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -20,6 +21,51 @@ PROTON_CLI_COMMAND = [
 
 
 CLI_TIMEOUT_SECONDS = 90
+COUNTRIES: dict[str, str] = json.loads(Path(__file__).with_name("countries.json").read_text(encoding="utf-8"))
+SETTING_VALUES = {
+    "kill-switch": ("off", "standard"),
+    "netshield": ("off", "malware-only", "malware-ads-trackers"),
+    "vpn-accelerator": ("off", "on"),
+    "moderate-nat": ("off", "on"),
+}
+
+
+def panel_snapshot() -> dict:
+    try:
+        result = json.loads(run_cli(["panel-snapshot"]))
+        if not isinstance(result, dict) or type(result.get("signed_in")) is not bool:
+            raise ValueError()
+        settings = result.get("settings", {})
+        if not isinstance(settings, dict) or any(name not in SETTING_VALUES or value not in (*SETTING_VALUES[name], None) for name, value in settings.items()):
+            raise ValueError()
+        mode = settings.get("kill-switch")
+        result["kill_switch"] = mode == "standard" if mode is not None else None
+        return {name: result[name] for name in ("signed_in", "settings", "settings_error", "requires_upgrade", "requires_reconnect", "kill_switch") if name in result}
+    except (ValueError, TypeError):
+        raise RuntimeError("Proton returned an unsupported panel snapshot") from None
+
+
+def connection_status() -> dict:
+    unknown = {"connected": None, "tunnel_active": None, "server": "", "protocol": "", "error": "NetworkManager connection state is unavailable"}
+    try:
+        result = subprocess.run(
+            ["/usr/bin/nmcli", "-t", "-f", "TYPE,DEVICE,STATE,NAME", "connection", "show", "--active"],
+            capture_output=True, check=False, stdin=subprocess.DEVNULL, text=True,
+            timeout=5, env=cli_environment(), start_new_session=True,
+        )
+        if result.returncode != 0:
+            return unknown
+        for line in result.stdout.splitlines():
+            fields = line.split(":", 3)
+            if len(fields) != 4 or fields[:2] != ["wireguard", "proton0"]:
+                continue
+            if fields[2] != "activated":
+                return unknown
+            server = re.search(r"\b[A-Z]{2}(?:-[A-Z0-9]+)?#\d+\b", fields[3])
+            return {"connected": True, "tunnel_active": True, "server": server.group() if server else "", "protocol": "WireGuard"}
+        return {"connected": False, "tunnel_active": False, "server": "", "protocol": ""}
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return unknown
 
 
 def cli_environment() -> dict[str, str]:
@@ -83,14 +129,17 @@ def run_cli(arguments: list[str]) -> str:
     operation = {
         "info": "account check",
         "status": "connection status",
+        "panel-snapshot": "account and settings",
         "countries": "country list",
         "connect": "connection",
         "disconnect": "disconnection",
+        "signout": "sign-out",
+        "config": "configuration",
     }.get(arguments[0] if arguments else "", "command")
     try:
         environment = cli_environment()
         command = cli_command(arguments)
-        if arguments and arguments[0] in ("connect", "disconnect"):
+        if arguments and (arguments[0] in ("connect", "disconnect", "signout") or arguments[:2] == ["config", "set"]):
             runtime_dir = f"/run/user/{os.getuid()}"
             bus_address = f"unix:path={runtime_dir}/bus"
             if os.getuid() == 0:
@@ -131,6 +180,10 @@ def run_cli(arguments: list[str]) -> str:
             )
         if "authentication required" in lowered or "please sign in" in lowered:
             raise RuntimeError("Proton CLI is signed out; sign in first")
+        if "disconnect before changing kill switch" in lowered:
+            raise RuntimeError("Disconnect the VPN before changing the kill switch")
+        if "not available on your current subscription plan" in lowered:
+            raise RuntimeError("This setting requires Proton VPN Plus")
         category = command_failure_category(message)
         identifiers = ", ".join(identifier for identifier in (
             "InitError", "KeyringLocked", "KeyringError", "NoKeyringError",

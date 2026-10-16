@@ -10,7 +10,7 @@ const source = readFileSync(new URL("../src/signin.ts", import.meta.url), "utf8"
 const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2020 },
 }).outputText;
-const { encodeSignIn, encryptSignIn } = await import(
+const { cachedUsername, rememberUsername, encodeSignIn, encryptSignIn } = await import(
   `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`
 );
 
@@ -60,6 +60,40 @@ function backend(request) {
 
 const keypair = backend({ action: "keypair" });
 const credentials = { username: "dummy-user", password: "dummy-password", totp: "123456" };
+
+test("username cache stores only a validated username", () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  const values = new Map();
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
+    getItem: key => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+  } });
+  try {
+    assert.equal(cachedUsername(), "");
+    rememberUsername(credentials.username);
+    assert.equal(cachedUsername(), credentials.username);
+    assert.deepEqual([...values], [["decky-protonvpn.username", credentials.username]]);
+    rememberUsername("invalid\nname");
+    assert.equal(cachedUsername(), credentials.username);
+    values.set("decky-protonvpn.username", JSON.stringify(credentials));
+    assert.equal(cachedUsername(), "");
+  } finally {
+    if (previous) Object.defineProperty(globalThis, "localStorage", previous);
+    else delete globalThis.localStorage;
+  }
+});
+
+test("unavailable browser storage does not block sign-in", () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, get() { throw new Error("Storage unavailable"); } });
+  try {
+    assert.equal(cachedUsername(), "");
+    assert.doesNotThrow(() => rememberUsername("dummy-user"));
+  } finally {
+    if (previous) Object.defineProperty(globalThis, "localStorage", previous);
+    else delete globalThis.localStorage;
+  }
+});
 
 test("Web Crypto encrypts credentials that backend OpenSSL decrypts once", async () => {
   const plaintext = encodeSignIn(credentials);

@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -136,7 +137,7 @@ class ReliabilityTests(unittest.TestCase):
         with (
             patch.object(proton_cli, "flatpak_installed", return_value=True),
             patch.object(keyring, "ensure_service", side_effect=RuntimeError("Wallet unavailable")),
-            patch.object(proton_cli, "signed_in") as account,
+            patch.object(proton_cli, "panel_snapshot") as account,
         ):
             result = main._get_cli_status()
         self.assertIsNone(result["signed_in"])
@@ -144,7 +145,7 @@ class ReliabilityTests(unittest.TestCase):
         account.assert_not_called()
 
     def test_account_operations_prepare_wallet_before_account_read(self):
-        for operation in (main._get_cli_status, main._get_countries, main._disconnect):
+        for operation in (main._get_cli_status, main._disconnect):
             calls = Mock()
             calls.account.return_value = True
             with (
@@ -152,6 +153,7 @@ class ReliabilityTests(unittest.TestCase):
                 patch.object(proton_cli, "flatpak_installed", return_value=True),
                 patch.object(keyring, "ensure_service", side_effect=calls.wallet),
                 patch.object(proton_cli, "signed_in", side_effect=calls.account),
+                patch.object(proton_cli, "panel_snapshot", side_effect=lambda: calls.account() and {"signed_in": True}),
                 patch.object(proton_cli, "run_cli", return_value="Status: Disconnected"),
                 patch.object(main, "_get_status", return_value={}),
             ):
@@ -160,25 +162,25 @@ class ReliabilityTests(unittest.TestCase):
 
     def test_active_tunnel_remains_visible_when_keyring_fails(self):
         with (
-            patch.object(proton_cli, "tunnel_active", return_value=True),
+            patch.object(proton_cli, "connection_status", return_value={"connected": True, "tunnel_active": True}),
             patch.object(main, "_get_cli_status", return_value={"connected": None, "signed_in": None, "error": "Keyring unavailable"}),
         ):
             result = main._get_status()
         self.assertTrue(result["tunnel_active"])
-        self.assertIsNone(result["connected"])
+        self.assertTrue(result["connected"])
         self.assertEqual(result["error"], "Keyring unavailable")
 
-    def test_status_reports_both_mismatch_directions(self):
+    def test_networkmanager_is_authoritative_in_both_directions(self):
         for active in (True, False):
             with (
                 self.subTest(active=active),
-                patch.object(proton_cli, "tunnel_active", return_value=active),
+                patch.object(proton_cli, "connection_status", return_value={"connected": active, "tunnel_active": active}),
                 patch.object(main, "_get_cli_status", return_value={"connected": not active, "signed_in": True}),
             ):
                 result = main._get_status()
             self.assertIs(result["tunnel_active"], active)
-            self.assertIsNone(result["connected"])
-            self.assertIn("error", result)
+            self.assertIs(result["connected"], active)
+            self.assertNotIn("error", result)
 
     def test_tunnel_probe_is_bounded_and_ignores_unrelated_interfaces(self):
         for output, expected in (("wireguard:proton0\n", True), ("802-11-wireless:wlan0\nwireguard:other\n", False)):
@@ -192,6 +194,174 @@ class ReliabilityTests(unittest.TestCase):
                 self.assertIsNone(proton_cli.tunnel_active())
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "private-data")):
             self.assertIsNone(proton_cli.tunnel_active())
+
+
+class PanelSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_reads_metadata_and_settings_without_server_lookup(self):
+        controller = Mock(is_logged_in=True, user_on_free_tier=False)
+
+        async def setting(feature):
+            return "standard"
+
+        controller.get_feature_setting = setting
+        feature = types.SimpleNamespace(command="kill-switch", available_on_free_tier=True, click_type=types.SimpleNamespace(to_str=str))
+        result = await cli_compat.read_panel_snapshot(controller, [feature])
+        self.assertEqual(result["settings"], {"kill-switch": "standard"})
+        self.assertNotIn("connected", result)
+        controller.get_updated_server_list.assert_not_called()
+        controller.get_vpn_connector.assert_not_called()
+
+    async def test_snapshot_handles_free_tier_and_signed_out_without_connection_reads(self):
+        controller = Mock(is_logged_in=True, user_on_free_tier=True)
+        feature = types.SimpleNamespace(command="netshield", available_on_free_tier=False)
+        result = await cli_compat.read_panel_snapshot(controller, [feature])
+        self.assertTrue(result["signed_in"])
+        self.assertNotIn("connected", result)
+        self.assertNotIn("private-data", str(result))
+        self.assertEqual(result["requires_upgrade"], ["netshield"])
+        controller.get_feature_setting.assert_not_called()
+        controller.is_logged_in = False
+        self.assertFalse((await cli_compat.read_panel_snapshot(controller, [feature]))["signed_in"])
+        controller.get_vpn_connector.assert_not_called()
+
+    async def test_settings_failure_preserves_auth_without_exposing_details(self):
+        controller = Mock(is_logged_in=True, user_on_free_tier=False)
+
+        async def setting(feature):
+            raise RuntimeError("private-data")
+
+        controller.get_feature_setting = setting
+        feature = types.SimpleNamespace(command="netshield", available_on_free_tier=False)
+        result = await cli_compat.read_panel_snapshot(controller, [feature])
+        self.assertTrue(result["signed_in"])
+        self.assertEqual(result["settings_error"], "Proton settings could not be read")
+        self.assertNotIn("settings", result)
+        self.assertNotIn("private-data", str(result))
+
+
+class ConnectionSnapshotTests(unittest.TestCase):
+    def test_connection_rpc_works_during_cli_operation_without_proton_or_wallet(self):
+        expected = {"connected": True, "tunnel_active": True}
+        with main.CLI_OPERATION_LOCK, patch.object(proton_cli, "connection_status", return_value=expected), patch.object(proton_cli, "run_cli") as cli, patch.object(proton_cli, "flatpak_installed") as installed, patch.object(keyring, "ensure_service") as wallet:
+            self.assertEqual(asyncio.run(main.Plugin().get_connection_status()), expected)
+        cli.assert_not_called()
+        installed.assert_not_called()
+        wallet.assert_not_called()
+
+    def test_invalid_snapshot_is_rejected_without_echoing_output(self):
+        for output in ("private-data", "[]", '{"signed_in":"private-data"}', '{"signed_in":true,"settings":{"netshield":"private-data"}}'):
+            with self.subTest(output=output), patch.object(proton_cli, "run_cli", return_value=output):
+                with self.assertRaisesRegex(RuntimeError, "unsupported panel snapshot") as raised:
+                    proton_cli.panel_snapshot()
+                self.assertNotIn("private-data", str(raised.exception))
+
+    def test_connection_metadata_uses_only_networkmanager(self):
+        for output, connected, server in (
+            ("wireguard:proton0:activated:ProtonVPN CA#12", True, "CA#12"),
+            ("wireguard:proton0:activated:ProtonVPN", True, ""),
+            ("wireguard:proton0:activating:ProtonVPN", None, ""),
+            ("wifi:wlan0:activated:private-network", False, ""),
+        ):
+            with self.subTest(output=output), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")), patch.object(proton_cli, "run_cli") as cli:
+                result = proton_cli.connection_status()
+                self.assertIs(result["connected"], connected)
+                self.assertEqual(result["server"], server)
+                cli.assert_not_called()
+
+    def test_connection_failure_stays_unknown(self):
+        with patch.object(subprocess, "run", side_effect=OSError("private-data")):
+            result = proton_cli.connection_status()
+        self.assertIsNone(result["connected"])
+        self.assertNotIn("private-data", str(result))
+
+
+class PanelActionTests(unittest.TestCase):
+    def setUp(self):
+        guard = patch.object(main, "_require_account")
+        self.account = guard.start()
+        self.addCleanup(guard.stop)
+
+    def test_quick_connect_uses_fastest_server_without_country(self):
+        with patch.object(proton_cli, "run_cli") as cli, patch.object(main, "_get_status", return_value={"connected": True}):
+            self.assertTrue(main._quick_connect()["connected"])
+        cli.assert_called_once_with(["connect"])
+        self.account.assert_called_once_with()
+
+    def test_feature_actions_validate_allowlist_and_readback(self):
+        for name in ("netshield", "vpn-accelerator", "moderate-nat"):
+            for value in proton_cli.SETTING_VALUES[name]:
+                expected = {"settings": {name: value}, "connected": True, "requires_reconnect": [name]}
+                with self.subTest(name=name, value=value), patch.object(proton_cli, "run_cli") as cli, patch.object(main, "_get_status", return_value=expected):
+                    result = main._set_feature(name, value)
+                    self.assertNotIn("error", result)
+                    self.assertIn("reconnect", result["notice"])
+                    cli.assert_called_once_with(["config", "set", name, value])
+        with patch.object(proton_cli, "run_cli"), patch.object(main, "_get_status", return_value={"settings": {"netshield": "off"}}):
+            self.assertIn("error", main._set_feature("netshield", "malware-only"))
+        for name, value in (("kill-switch", "off"), ("custom-dns", "on"), ([], "on"), ("netshield", "private-data"), ("moderate-nat", True)):
+            with self.subTest(name=name, value=value), patch.object(proton_cli, "run_cli") as cli:
+                with self.assertRaises(ValueError):
+                    getattr(main, "_set_feature")(name, value)
+                cli.assert_not_called()
+
+    def test_feature_rpc_does_not_run_when_busy(self):
+        with main.CLI_OPERATION_LOCK, patch.object(main, "_set_feature") as action:
+            result = asyncio.run(main.Plugin().set_feature("netshield", "off"))
+        self.assertIn("in progress", result["error"])
+        action.assert_not_called()
+
+    def test_kill_switch_reads_real_setting_and_rejects_unknown(self):
+        for output, expected in (("kill-switch              off", False), ("kill-switch  standard", True), ("kill-switch permanent", None), ("", None)):
+            with self.subTest(output=output), patch.object(proton_cli, "run_cli", return_value=output) as cli:
+                self.assertIs(main._get_settings()["kill_switch"], expected)
+                cli.assert_called_once_with(["config", "list"])
+
+    @patch.object(proton_cli, "tunnel_active", return_value=False)
+    def test_toggle_validates_input_and_checks_readback(self, tunnel):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), patch.object(proton_cli, "run_cli") as cli, patch.object(main, "_get_settings", return_value={"kill_switch": enabled}), patch.object(main, "_get_status", return_value={}):
+                self.assertIs(main._set_kill_switch(enabled)["kill_switch"], enabled)
+                cli.assert_called_once_with(["config", "set", "kill-switch", "standard" if enabled else "off"])
+        for invalid in ("false", 1, None):
+            with self.subTest(invalid=invalid), patch.object(proton_cli, "run_cli") as cli:
+                with self.assertRaises(ValueError):
+                    main._set_kill_switch(invalid)
+                cli.assert_not_called()
+        with patch.object(proton_cli, "run_cli"), patch.object(main, "_get_settings", return_value={"kill_switch": False}), patch.object(main, "_get_status", return_value={}):
+            self.assertIn("error", main._set_kill_switch(True))
+        self.assertEqual(tunnel.call_count, 3)
+
+    def test_kill_switch_refuses_active_or_unknown_tunnel_without_commands(self):
+        for enabled in (True, False):
+            for active, message in ((True, "Disconnect the VPN"), (None, "Cannot verify tunnel state")):
+                with self.subTest(enabled=enabled, active=active), patch.object(proton_cli, "tunnel_active", return_value=active), patch.object(proton_cli, "run_cli") as cli, patch.object(main, "_disconnect") as disconnect:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        main._set_kill_switch(enabled)
+                    cli.assert_not_called()
+                    disconnect.assert_not_called()
+
+    def test_kill_switch_cli_refusal_is_readable_without_raw_output(self):
+        environment = {"XDG_RUNTIME_DIR": "/run/user/1000", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"}
+        failure = subprocess.CompletedProcess([], 2, "private-data", "Error: Disconnect before changing Kill Switch. Run 'protonvpn disconnect' first.")
+        with patch.object(proton_cli.os, "getuid", return_value=1000), patch.object(proton_cli, "cli_environment", return_value=environment), patch.object(subprocess, "run", return_value=failure):
+            with self.assertRaises(RuntimeError) as raised:
+                proton_cli.run_cli(["config", "set", "kill-switch", "standard"])
+        self.assertEqual(str(raised.exception), "Disconnect the VPN before changing the kill switch")
+
+    def test_signout_disconnects_first_and_verifies_logout(self):
+        calls = Mock()
+        with patch.object(proton_cli, "tunnel_active", return_value=True), patch.object(main, "_disconnect", side_effect=lambda: calls.disconnect() or {}) as disconnect, patch.object(proton_cli, "run_cli", side_effect=calls.cli), patch.object(main, "_get_status", return_value={"signed_in": False, "tunnel_active": False}):
+            calls.disconnect.return_value = {"tunnel_active": False}
+            self.assertFalse(main._signout()["signed_in"])
+            disconnect.assert_called_once_with()
+        self.assertEqual(calls.mock_calls, [call.disconnect(), call.cli(["signout"])])
+
+    def test_signout_refuses_unknown_or_failed_disconnect(self):
+        for active, disconnected in ((None, {}), (True, {"tunnel_active": True}), (True, {"error": "failed", "tunnel_active": False})):
+            with self.subTest(active=active, disconnected=disconnected), patch.object(proton_cli, "tunnel_active", return_value=active), patch.object(main, "_disconnect", return_value=disconnected), patch.object(proton_cli, "run_cli") as cli:
+                with self.assertRaisesRegex(RuntimeError, "sign-out was not attempted"):
+                    main._signout()
+                cli.assert_not_called()
 
 
 class RouteSnapshotTests(unittest.TestCase):
@@ -279,7 +449,7 @@ class RouteSnapshotTests(unittest.TestCase):
 
     def test_all_commands_use_guard_and_only_network_uses_service(self):
         launcher = Path(cli_compat.__file__).read_text(encoding="utf-8")
-        for arguments in (["connect"], ["connect", "--country", "US"], ["disconnect"], ["status"], ["info"], ["countries", "list"]):
+        for arguments in (["connect"], ["connect", "--country", "US"], ["disconnect"], ["signout"], ["config", "set", "kill-switch", "standard"], ["config", "list"], ["status"], ["info"], ["countries", "list"]):
             with self.subTest(arguments=arguments), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok", "")) as run:
                 self.assertEqual(proton_cli.run_cli(arguments), "ok")
                 expected = (
@@ -294,7 +464,7 @@ class RouteSnapshotTests(unittest.TestCase):
                         f"--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{os.getuid()}/bus",
                         "--", proton_cli.FLATPAK, "run", "--command=python3", proton_cli.PROTON_APP_ID, "-c", launcher, *arguments,
                     ]
-                    if arguments[0] in ("connect", "disconnect")
+                    if arguments[0] in ("connect", "disconnect", "signout") or arguments[:3] == ["config", "set", "kill-switch"]
                     else [proton_cli.FLATPAK, "run", "--command=python3", proton_cli.PROTON_APP_ID, "-c", launcher, *arguments]
                 )
                 self.assertEqual(run.call_args.args[0], expected)
@@ -303,7 +473,7 @@ class RouteSnapshotTests(unittest.TestCase):
                 run.assert_called_once()
 
     def test_network_commands_refuse_root_or_nonstandard_user_bus(self):
-        for arguments in (["connect"], ["disconnect"]):
+        for arguments in (["connect"], ["disconnect"], ["signout"], ["config", "set", "kill-switch", "off"]):
             with self.subTest(arguments=arguments), patch.object(os, "getuid", return_value=0), patch.object(subprocess, "run") as run:
                 with self.assertRaisesRegex(RuntimeError, "not root"):
                     proton_cli.run_cli(arguments)
@@ -921,15 +1091,15 @@ class KeyringDiagnosticTests(unittest.TestCase):
             with (
                 self.subTest(category=category),
                 patch.object(proton_cli, "flatpak_installed", return_value=True),
-                patch.object(proton_cli, "run_cli", side_effect=["Account: 'private-user'", failure]) as cli,
+                patch.object(proton_cli, "run_cli", side_effect=failure) as cli,
                 patch.object(keyring, "diagnostics", return_value={"Default collection": "locked"}) as probe,
                 patch.object(main.decky, "logger", create=True) as logger,
             ):
                 report = main._get_status()
-                self.assertTrue(report["signed_in"])
+                self.assertIsNone(report["signed_in"])
                 self.assertIsNone(report["connected"])
                 self.assertEqual(report["diagnostics"], {"Default collection": "locked", "CLI exception types": "not reported"})
-                self.assertEqual(cli.call_args_list, [call(["info"]), call(["status"])])
+                self.assertEqual(cli.call_args_list, [call(["panel-snapshot"])])
                 probe.assert_called_once_with()
                 logger.warning.assert_called_once()
                 self.assertNotIn("private", str(logger.warning.call_args))
@@ -1029,7 +1199,8 @@ class ProtonCLITests(unittest.TestCase):
     def test_status_failure_preserves_confirmed_signin(self):
         with (
             patch.object(proton_cli, "flatpak_installed", return_value=True),
-            patch.object(proton_cli, "run_cli", side_effect=["Account: 'dummy-user'", RuntimeError("status failed")]),
+            patch.object(proton_cli, "run_cli", return_value=json.dumps({"signed_in": True})),
+            patch.object(proton_cli, "connection_status", return_value={"connected": None, "tunnel_active": None, "error": "status failed"}),
         ):
             result = main._get_status()
         self.assertTrue(result["signed_in"])
@@ -1109,7 +1280,8 @@ class ProtonCLITests(unittest.TestCase):
             countries = main._get_countries()
         self.assertIsNone(result["installed"])
         self.assertEqual(result["error"], "Flatpak check failed")
-        self.assertEqual(countries["error"], "Flatpak check failed")
+        self.assertNotIn("error", countries)
+        self.assertTrue(countries["countries"])
         run_cli.assert_not_called()
 
     def test_flatpak_detection_checks_application_list(self):
@@ -1179,11 +1351,9 @@ class ProtonCLITests(unittest.TestCase):
             patch.object(
                 proton_cli,
                 "run_cli",
-                side_effect=[
-                    "Account: 'user@example.com'",
-                    "Status: Connected\nServer: US-CA#856\nProtocol: wireguard",
-                ],
+                return_value=json.dumps({"signed_in": True, "account": "user@example.com", "settings": {"kill-switch": "off"}}),
             ),
+            patch.object(proton_cli, "connection_status", return_value={"connected": True, "tunnel_active": True}),
         ):
             status = main._get_status()
 
@@ -1197,12 +1367,12 @@ class ProtonCLITests(unittest.TestCase):
             patch.object(
                 proton_cli,
                 "run_cli",
-                side_effect=["Account: 'None'", "Status: Disconnected"],
+                return_value=json.dumps({"signed_in": False}),
             ),
         ):
             status = main._get_status()
 
-        self.assertFalse(status["signed_in"])
+        self.assertIs(status["signed_in"], False)
         self.assertIsNone(status["connected"])
 
     def test_missing_app_returns_install_guidance_state(self):
@@ -1215,23 +1385,22 @@ class ProtonCLITests(unittest.TestCase):
         self.assertFalse(status["installed"])
         run_cli.assert_not_called()
 
-    def test_get_countries_uses_proton_cli(self):
+    def test_get_countries_is_bundled_without_any_subprocess(self):
         with (
-            patch.object(proton_cli, "flatpak_installed", return_value=True),
-            patch.object(proton_cli, "signed_in", return_value=True),
-            patch.object(
-                proton_cli,
-                "run_cli",
-                return_value="Country  Code\nCanada   CA\nUnited States US",
-            ) as run_cli,
+            patch.object(subprocess, "run") as run,
+            patch.object(proton_cli, "run_cli") as run_cli,
         ):
             result = main._get_countries()
 
-        run_cli.assert_called_once_with(["countries", "list"])
-        self.assertEqual(result["countries"][0], {"name": "Canada", "code": "CA"})
+        run.assert_not_called()
+        run_cli.assert_not_called()
+        self.assertIn({"name": "Canada", "code": "CA"}, result["countries"])
+        self.assertTrue(all(re.fullmatch(r"[A-Z]{2}", country["code"]) for country in result["countries"]))
 
     def test_connect_country_validates_then_calls_cli(self):
         with (
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
+            patch.object(proton_cli, "signed_in", return_value=True),
             patch.object(
                 main,
                 "_get_countries",
@@ -1250,6 +1419,8 @@ class ProtonCLITests(unittest.TestCase):
     def test_connect_country_failure_does_not_retry(self):
         failure = proton_cli.CLICommandError("Proton VPN connection failed: Secret Service unavailable (exit 1)", "Secret Service unavailable")
         with (
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
+            patch.object(proton_cli, "signed_in", return_value=True),
             patch.object(main, "_get_countries", return_value={"signed_in": True, "countries": [{"name": "United States", "code": "US"}]}),
             patch.object(keyring, "start_service", return_value=(None, {})) as start,
             patch.object(proton_cli, "run_cli", side_effect=failure) as run_cli,
@@ -1262,6 +1433,7 @@ class ProtonCLITests(unittest.TestCase):
 
     def test_connect_country_keyring_failure_prevents_connection(self):
         with (
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
             patch.object(main, "_get_countries", return_value={"signed_in": True, "countries": [{"name": "United States", "code": "US"}]}),
             patch.object(keyring, "start_service", return_value=("No usable Steam display", {})) as start,
             patch.object(proton_cli, "run_cli") as run_cli,
@@ -1305,6 +1477,9 @@ class ProtonCLITests(unittest.TestCase):
         for method, target, arguments in (
             (plugin.connect_country, "_connect_country", ("US",)),
             (plugin.disconnect, "_disconnect", ()),
+            (plugin.quick_connect, "_quick_connect", ()),
+            (plugin.set_kill_switch, "_set_kill_switch", (True,)),
+            (plugin.signout, "_signout", ()),
         ):
             for failure in (
                 ValueError("Choose a valid Proton VPN country"),
@@ -1333,6 +1508,9 @@ class ProtonCLITests(unittest.TestCase):
         for method, target, arguments, connected in (
             (plugin.connect_country, "_connect_country", ("US",), True),
             (plugin.disconnect, "_disconnect", (), False),
+            (plugin.quick_connect, "_quick_connect", (), True),
+            (plugin.set_kill_switch, "_set_kill_switch", (True,), True),
+            (plugin.signout, "_signout", (), False),
         ):
             expected = {"installed": True, "signed_in": True, "connected": connected}
             with self.subTest(target=target), patch.object(main, target, return_value=expected):

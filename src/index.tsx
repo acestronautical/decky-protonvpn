@@ -1,15 +1,22 @@
 import {
-  ButtonItem,
-  Dropdown,
+  ConfirmModal,
+  DialogButton,
+  DropdownItem,
+  Focusable,
   PanelSection,
   PanelSectionRow,
   TextField,
+  Tabs,
+  ToggleField,
+  showModal,
   staticClasses,
 } from "@decky/ui";
 import { callable, definePlugin, toaster } from "@decky/api";
-import { useEffect, useRef, useState } from "react";
-import { FaShieldAlt } from "react-icons/fa";
-import { encodeSignIn, encryptSignIn } from "./signin";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { FaBolt, FaExchangeAlt, FaPowerOff, FaSignOutAlt, FaSlidersH, FaSyncAlt, FaUser } from "react-icons/fa";
+import { cachedUsername, encodeSignIn, encryptSignIn, rememberUsername } from "./signin";
+import protonIcon from "../protonvpn-dark.png";
+import countryNames from "../py_modules/protonvpn/countries.json";
 
 type ProtonCountry = {
   code: string;
@@ -26,13 +33,19 @@ type ProtonStatus = {
   error?: string;
   diagnostics?: Record<string, string>;
   can_start_keyring?: boolean;
+  kill_switch?: boolean | null;
+  settings?: Record<string, string | null>;
+  settings_error?: string;
+  requires_upgrade?: string[];
+  requires_reconnect?: string[];
+  notice?: string;
 };
 
-type CountryList = {
-  signed_in: boolean;
-  countries: ProtonCountry[];
-  error?: string;
-};
+type ConnectionStatus = Pick<ProtonStatus, "connected" | "tunnel_active" | "server" | "protocol" | "error">;
+
+const countries: ProtonCountry[] = Object.entries(countryNames)
+  .map(([code, name]) => ({ code, name }))
+  .sort((first, second) => first.name.localeCompare(second.name));
 
 type SignInSession = {
   session_id: string;
@@ -42,8 +55,8 @@ type SignInSession = {
 type SignInError = { error: string };
 
 const getStatus = callable<[], ProtonStatus>("get_status");
+const getConnectionStatus = callable<[], ConnectionStatus>("get_connection_status");
 const startKeyring = callable<[], ProtonStatus>("start_keyring");
-const getCountries = callable<[], CountryList>("get_countries");
 const beginSignIn = callable<[], SignInSession | SignInError>("begin_signin");
 const cancelSignIn = callable<[sessionId: string], void>("cancel_signin");
 const completeSignIn = callable<
@@ -54,35 +67,81 @@ const connectCountry = callable<[countryCode: string], ProtonStatus>(
   "connect_country",
 );
 const disconnect = callable<[], ProtonStatus>("disconnect");
+const quickConnect = callable<[], ProtonStatus>("quick_connect");
+const signOut = callable<[], ProtonStatus>("signout");
+const setKillSwitch = callable<[enabled: boolean], ProtonStatus>("set_kill_switch");
+const setFeature = callable<[name: string, value: string], ProtonStatus>("set_feature");
+
+let detailsRequest: Promise<ProtonStatus> | undefined;
+function readDetails() {
+  if (!detailsRequest) {
+    detailsRequest = getStatus().finally(() => { detailsRequest = undefined; });
+  }
+  return detailsRequest;
+}
+
+function ProtonIcon({ size = "1em" }: { size?: number | string }) {
+  return (
+    <img src={protonIcon} width={size} height={size} alt="Proton VPN" style={{ width: size, height: size, flexShrink: 0, objectFit: "contain" }} />
+  );
+}
+
+const actionStyle = { width: "100%", minWidth: 0, minHeight: 44, padding: "10px 12px", borderRadius: 4, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, whiteSpace: "normal" as const, overflowWrap: "anywhere" as const };
+
+let pendingCountry = "";
+let pendingNetshield: string | undefined;
+let lastTab = "connection";
+const countryListeners = new Set<() => void>();
+
+function subscribeCountry(listener: () => void) {
+  countryListeners.add(listener);
+  return () => { countryListeners.delete(listener); };
+}
+
+function getSelectedCountry() {
+  return pendingCountry;
+}
+
+function setSelectedCountry(country: string) {
+  pendingCountry = country;
+  for (const listener of countryListeners) listener();
+}
+
+function setSelectedNetshield(value: string | undefined) {
+  pendingNetshield = value;
+  for (const listener of countryListeners) listener();
+}
+
+function getSelectedNetshield() {
+  return pendingNetshield;
+}
 
 function Content() {
   const [status, setStatus] = useState<ProtonStatus>();
-  const [countries, setCountries] = useState<ProtonCountry[]>([]);
-  const [selectedCountry, setSelectedCountry] = useState("");
-  const [username, setUsername] = useState("");
+  const [activeTab, setActiveTab] = useState(() => lastTab);
+  const selectedCountry = useSyncExternalStore(subscribeCountry, getSelectedCountry);
+  const selectedNetshield = useSyncExternalStore(subscribeCountry, getSelectedNetshield);
+  const [username, setUsername] = useState(cachedUsername);
   const [password, setPassword] = useState("");
   const [totp, setTotp] = useState("");
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
-  const [loadingCountries, setLoadingCountries] = useState(false);
+  const [loadingSettings, setLoadingSettings] = useState(true);
   const [signingIn, setSigningIn] = useState(false);
+  const [killSwitch, setKillSwitchValue] = useState<boolean | null>(null);
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const actionPending = useRef(false);
   const mounted = useRef(true);
   const signInRequest = useRef<{
     plaintext: Uint8Array;
     sessionId?: string;
   } | undefined>(undefined);
 
-  const refreshStatus = async (action = getStatus) => {
-    setBusy(true);
-    try {
-      const result = await action();
-      setStatus(result);
-      setError(result.error);
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBusy(false);
-    }
+  const applyResult = (result: ConnectionStatus | ProtonStatus) => {
+    setStatus((previous) => ({ installed: null, signed_in: null, ...previous, ...result, error: result.error, notice: "notice" in result ? result.notice : undefined }));
+    setError(result.error ?? ("settings_error" in result ? result.settings_error : undefined));
+    if ("kill_switch" in result) setKillSwitchValue(result.kill_switch ?? null);
   };
 
   useEffect(() => {
@@ -98,84 +157,47 @@ function Content() {
   }, []);
 
   useEffect(() => {
-    let mounted = true;
-    void getStatus()
-      .then((result) => {
-        if (mounted) {
-          setStatus(result);
-          setError(result.error);
+    let current = true;
+    setLoadingSettings(true);
+    const load = async () => {
+      try {
+        const result = await (activeTab === "connection" ? getConnectionStatus() : readDetails());
+        if (current) applyResult(result);
+        if (activeTab === "connection" && detailsRequest) {
+          await detailsRequest.catch(() => {});
         }
-      })
-      .catch((reason) => {
-        if (mounted) {
-          setError(String(reason));
-        }
-      });
-    return () => {
-      mounted = false;
+      } catch (reason) {
+        if (current) applyResult({ connected: null, tunnel_active: null, error: String(reason) });
+      } finally {
+        if (current) setLoadingSettings(false);
+      }
     };
-  }, []);
-
-  useEffect(() => {
-    let mounted = true;
-    if (!status?.signed_in || status.error) {
-      setCountries([]);
-      setSelectedCountry("");
-      setLoadingCountries(false);
-      return;
-    }
-
-    setLoadingCountries(true);
-    void getCountries()
-      .then((result) => {
-        if (!mounted) {
-          return;
-        }
-        setCountries(result.countries);
-        setError(result.error);
-        setSelectedCountry((current) =>
-          result.countries.some((country) => country.code === current)
-            ? current
-            : result.countries.find((country) => country.code === "US")?.code ??
-              result.countries[0]?.code ??
-              "",
-        );
-      })
-      .catch((reason) => {
-        if (mounted) {
-          setError(String(reason));
-        }
-      })
-      .finally(() => {
-        if (mounted) {
-          setLoadingCountries(false);
-        }
-      });
-
-    return () => {
-      mounted = false;
-    };
-  }, [status?.signed_in, status?.error]);
+    void load();
+    return () => { current = false; };
+  }, [activeTab, refreshVersion]);
 
   const runAction = async (action: () => Promise<ProtonStatus>, success: string) => {
+    if (actionPending.current || signInRequest.current || loadingSettings) return;
+    actionPending.current = true;
     setBusy(true);
     setError(undefined);
     try {
       const result = await action();
-      setStatus(result);
-      setError(result.error);
-      toaster.toast({ title: "Proton VPN", body: result.error ?? success });
+      if (mounted.current) applyResult(result);
+      if (!result.error && result.settings?.netshield === pendingNetshield) setSelectedNetshield(undefined);
+      toaster.toast({ title: "Proton VPN", body: result.error ?? result.notice ?? success });
     } catch (reason) {
       const message = String(reason);
       setError(message);
       toaster.toast({ title: "Proton VPN", body: message });
     } finally {
+      actionPending.current = false;
       setBusy(false);
     }
   };
 
   const submitSignIn = async () => {
-    if (signInRequest.current || busy) {
+    if (signInRequest.current || actionPending.current || busy) {
       return;
     }
     setSigningIn(true);
@@ -187,6 +209,7 @@ function Content() {
       const request: { plaintext: Uint8Array; sessionId?: string } = {
         plaintext: encodeSignIn({ username, password, totp }),
       };
+      rememberUsername(username);
       signInRequest.current = request;
       setPassword("");
       setTotp("");
@@ -209,10 +232,8 @@ function Content() {
       if (!("installed" in result)) {
         throw new Error(result.error);
       }
-      setStatus(result);
-      setError(result.error);
+      applyResult(result);
       if (result.signed_in) {
-        setUsername("");
         toaster.toast({ title: "Proton VPN", body: result.error ?? "Signed in" });
       }
     } catch (reason) {
@@ -237,59 +258,154 @@ function Content() {
   };
 
   const selected = countries.find((country) => country.code === selectedCountry);
+  const blocked = busy || signingIn || loadingSettings;
+  const active = status?.tunnel_active === true || status?.connected === true;
+  const canChangeKillSwitch = status?.connected === false && status?.tunnel_active === false;
+  const connectionAction = selectedCountry ? () => connectCountry(selectedCountry) : quickConnect;
+  const confirmSignOut = () => showModal(
+    <ConfirmModal
+      strTitle="Sign out of Proton VPN?"
+      strDescription="This disconnects the VPN and signs out. Your saved username stays on this device."
+      strOKButtonText="Sign out"
+      strCancelButtonText="Cancel"
+      bDestructiveWarning
+      onOK={() => void runAction(signOut, "Signed out")}
+    />,
+  );
+  const changeKillSwitch = (enabled: boolean) => {
+    if (blocked || killSwitch === null || !canChangeKillSwitch) return;
+    if (enabled) {
+      void runAction(() => setKillSwitch(true), "Kill switch enabled");
+    } else {
+      showModal(
+        <ConfirmModal
+          strTitle="Disable kill switch?"
+          strDescription="Internet traffic may continue outside the VPN if the connection drops."
+          strOKButtonText="Disable"
+          strCancelButtonText="Cancel"
+          bDestructiveWarning
+          onOK={() => void runAction(() => setKillSwitch(false), "Kill switch disabled")}
+        />,
+      );
+    }
+  };
 
-  return (
-    <>
-      <PanelSection title="Status">
-        <PanelSectionRow>
-          <div>
-            {!status
-              ? "Checking Proton VPN CLI..."
-              : status.tunnel_active === true && status.connected !== true
-                ? "VPN tunnel active; Proton status unavailable"
-                : status.error
-                ? "Proton VPN status is unavailable"
-                : !status.installed
-                  ? "Proton VPN is not installed. Install it from Discover in Desktop Mode."
-                  : !status.signed_in
-                    ? "Proton VPN CLI is signed out; VPN state is unknown"
-                    : status.connected
-                      ? `Connected: ${status.server || "Proton VPN"}`
-                      : "Disconnected"}
-          </div>
-        </PanelSectionRow>
-        {status?.protocol && (
+  const changeTab = (tab: string) => {
+    if (busy || signingIn || !["connection", "settings", "account"].includes(tab)) return;
+    if (tab !== "account") {
+      setPassword("");
+      setTotp("");
+    }
+    lastTab = tab;
+    setActiveTab(tab);
+  };
+
+  const issue = error && (
+        <PanelSection title="Issue">
           <PanelSectionRow>
-            <div>Protocol: {status.protocol}</div>
+            <div role="alert" style={{ fontSize: 13, overflowWrap: "anywhere", paddingBottom: 8 }}>{error}</div>
           </PanelSectionRow>
-        )}
-        {error && (
           <PanelSectionRow>
-            <div>{error}</div>
+            <DialogButton style={actionStyle} disabled={blocked} onClick={() => {
+              if (activeTab !== "connection" && status?.can_start_keyring) void runAction(startKeyring, "Account checked");
+              else setRefreshVersion((version) => version + 1);
+            }}>
+              <FaSyncAlt /> Retry
+            </DialogButton>
           </PanelSectionRow>
-        )}
-        {status?.can_start_keyring && (
-          <PanelSectionRow>
-            <ButtonItem disabled={busy || signingIn} onClick={() => void refreshStatus(startKeyring)}>
-              Start existing keyring service
-            </ButtonItem>
-          </PanelSectionRow>
-        )}
-        {status?.diagnostics && (
-          <PanelSectionRow>
-            <div style={{ fontSize: 12, overflowWrap: "anywhere" }}>
-              {Object.entries(status.diagnostics).map(([label, value]) => (
-                <div key={label}>{label}: {value}</div>
-              ))}
+          {activeTab !== "connection" && status?.diagnostics && (
+            <>
+              <PanelSectionRow>
+                <ToggleField label="Diagnostic details" checked={showDiagnostics} onChange={setShowDiagnostics} />
+              </PanelSectionRow>
+              {showDiagnostics && <PanelSectionRow>
+                <div style={{ fontSize: 12, overflowWrap: "anywhere" }}>
+                  {Object.entries(status.diagnostics).map(([label, value]) => <div key={label}>{label}: {value}</div>)}
+                </div>
+              </PanelSectionRow>}
+            </>
+          )}
+        </PanelSection>
+  );
+
+  const connectionView = <>
+    <PanelSection>
+      <PanelSectionRow>
+        <Focusable tabIndex={0} role="group" aria-label="VPN connection status" onFocus={(event) => event.currentTarget.scrollIntoView({ block: "start", behavior: "auto" })} style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 0 12px", minWidth: 0 }}>
+          <ProtonIcon size={28} />
+          <div style={{ minWidth: 0, overflowWrap: "anywhere" }}>
+            <div style={{ fontSize: 16, fontWeight: 600 }}>
+              {!status ? "Checking connection..." : active ? "Connected" : status.connected === false ? "Disconnected" : "Status unavailable"}
             </div>
-          </PanelSectionRow>
-        )}
+            <div style={{ fontSize: 12, color: "var(--gpSystemLightGrey, #b8bcbf)", marginTop: 4 }}>
+              {status?.server || "Proton VPN"}{status?.protocol ? ` / ${status.protocol}` : ""}
+            </div>
+          </div>
+        </Focusable>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <DialogButton style={actionStyle} disabled={blocked || status?.connected == null || !!error} onClick={() => void runAction(active ? disconnect : connectionAction, active ? "Disconnected" : "Connected")}>
+          {active ? <FaPowerOff /> : <FaBolt />}
+          {busy ? "Working..." : active ? "Disconnect" : selectedCountry ? "Connect" : "Quick connect"}
+        </DialogButton>
+      </PanelSectionRow>
+    </PanelSection>
+    <PanelSection title="Location">
+      <PanelSectionRow>
+        <DropdownItem label="Server" layout="below" rgOptions={[{ data: "", label: "Fastest available" }, ...countries.map((country) => ({ data: country.code, label: country.name }))]} selectedOption={selectedCountry} disabled={blocked} menuLabel="VPN location" strDefaultLabel="Fastest available" onChange={(option) => setSelectedCountry(String(option.data))} />
+      </PanelSectionRow>
+      {active && <PanelSectionRow>
+        <DialogButton style={actionStyle} disabled={blocked || !!error} onClick={() => void runAction(connectionAction, selected ? `Connected to ${selected.name}` : "Connected to fastest server")}>
+          <FaExchangeAlt /> Switch server
+        </DialogButton>
+      </PanelSectionRow>}
+    </PanelSection>
+    {issue}
+  </>;
+
+  const accountPrompt = !loadingSettings && status?.signed_in === false && <PanelSection>
+    <PanelSectionRow><DialogButton style={actionStyle} onClick={() => changeTab("account")}>Sign in</DialogButton></PanelSectionRow>
+  </PanelSection>;
+  const settingsView = <>
+    {loadingSettings && <PanelSection><PanelSectionRow>Checking settings...</PanelSectionRow></PanelSection>}
+    {status?.signed_in && <>
+      <PanelSection title="Protection">
         <PanelSectionRow>
-          <ButtonItem disabled={busy || signingIn} onClick={() => void refreshStatus()}>
-            Refresh Proton VPN status
-          </ButtonItem>
+          <ToggleField label="Kill switch" description={killSwitch === null ? "Unavailable" : `${killSwitch ? "Standard" : "Off"}${active ? " - disconnect to change" : !canChangeKillSwitch ? " - VPN state unknown" : ""}`} checked={killSwitch === true} disabled={blocked || !!error || killSwitch === null || !canChangeKillSwitch} onChange={changeKillSwitch} />
         </PanelSectionRow>
+        <PanelSectionRow>
+          <DropdownItem label="NetShield" layout="below" menuLabel="NetShield" strDefaultLabel={status.requires_upgrade?.includes("netshield") ? "VPN Plus required" : "Unavailable"} selectedOption={selectedNetshield ?? status.settings?.netshield ?? undefined} disabled={blocked || !!error || status.settings?.netshield == null} rgOptions={[
+            { data: "off", label: "Off" },
+            { data: "malware-only", label: "Block malware" },
+            { data: "malware-ads-trackers", label: "Block malware, ads and trackers" },
+          ]} onChange={(option) => setSelectedNetshield(String(option.data))} />
+        </PanelSectionRow>
+        {selectedNetshield !== undefined && selectedNetshield !== status.settings?.netshield && <PanelSectionRow>
+          <DialogButton style={actionStyle} disabled={blocked || !!error || status.settings?.netshield == null} onClick={() => void runAction(() => setFeature("netshield", selectedNetshield), "NetShield updated")}><FaPowerOff /> Apply NetShield</DialogButton>
+        </PanelSectionRow>}
       </PanelSection>
+      <PanelSection title="Performance">
+        {[["vpn-accelerator", "VPN Accelerator"], ["moderate-nat", "Moderate NAT"]].map(([name, label]) => {
+          const value = status.settings?.[name];
+          return <PanelSectionRow key={name}>
+            <ToggleField label={label} description={status.requires_upgrade?.includes(name) ? "VPN Plus required" : value == null ? "Unavailable" : status.requires_reconnect?.includes(name) && active ? "Applies after reconnect" : undefined} checked={value === "on"} disabled={blocked || !!error || value == null} onChange={(enabled) => {
+              if (!blocked && !error && value != null) void runAction(() => setFeature(name, enabled ? "on" : "off"), `${label} updated`);
+            }} />
+          </PanelSectionRow>;
+        })}
+      </PanelSection>
+      {status.notice && <PanelSection><PanelSectionRow><div role="status">{status.notice}</div></PanelSectionRow></PanelSection>}
+    </>}
+    {accountPrompt}
+    {issue}
+  </>;
+
+  const accountView = <>
+    {loadingSettings && <PanelSection><PanelSectionRow>Checking account...</PanelSectionRow></PanelSection>}
+    {status?.installed === false && <PanelSection><PanelSectionRow>Install Proton VPN from Discover in Desktop Mode.</PanelSectionRow></PanelSection>}
+    {status?.signed_in && <PanelSection title="Account"><PanelSectionRow>
+      <DialogButton style={actionStyle} disabled={blocked || !!error} onClick={confirmSignOut}><FaSignOutAlt /> Sign out</DialogButton>
+    </PanelSectionRow></PanelSection>}
 
       {status?.installed && status.signed_in === false && !status.error && (
         <PanelSection title="Sign in">
@@ -297,7 +413,7 @@ function Content() {
             <TextField
               label="Proton username"
               value={username}
-              disabled={signingIn}
+              disabled={blocked}
               onChange={(event) => setUsername(event.currentTarget.value)}
             />
           </PanelSectionRow>
@@ -309,89 +425,45 @@ function Content() {
               bIsPassword
               bShowCopyAction={false}
               spellCheck={false}
-              disabled={signingIn}
+              disabled={blocked}
               onChange={(event) => setPassword(event.currentTarget.value)}
             />
           </PanelSectionRow>
           <PanelSectionRow>
             <TextField
-              label="Authenticator or recovery code (if required)"
+              label="2FA or recovery code"
               {...{ type: "password", autoComplete: "off" }}
               value={totp}
               bIsPassword
               bShowCopyAction={false}
               spellCheck={false}
-              disabled={signingIn}
+              disabled={blocked}
               onChange={(event) => setTotp(event.currentTarget.value)}
             />
           </PanelSectionRow>
           <PanelSectionRow>
-            <ButtonItem
-              disabled={busy || signingIn || !username || !password}
+            <DialogButton
+              style={actionStyle}
+              disabled={blocked || !username || !password}
               onClick={() => void submitSignIn()}
             >
               {signingIn ? "Signing in..." : "Sign in"}
-            </ButtonItem>
+            </DialogButton>
           </PanelSectionRow>
         </PanelSection>
       )}
+    {issue}
+  </>;
 
-      {status?.installed && status.signed_in && !status.error && (
-        <PanelSection title="Proton VPN Location">
-          {loadingCountries ? (
-            <PanelSectionRow>
-              <div>Loading Proton VPN countries...</div>
-            </PanelSectionRow>
-          ) : countries.length === 0 ? (
-            <PanelSectionRow>
-              <div>No countries are available for this Proton account.</div>
-            </PanelSectionRow>
-          ) : (
-            <PanelSectionRow>
-              <Dropdown
-                rgOptions={countries.map((country) => ({
-                  data: country.code,
-                  label: country.name,
-                }))}
-                selectedOption={selectedCountry}
-                disabled={busy}
-                menuLabel="Choose a Proton VPN country"
-                strDefaultLabel="Choose country"
-                onChange={(option) => setSelectedCountry(String(option.data))}
-              />
-            </PanelSectionRow>
-          )}
-          <PanelSectionRow>
-            <ButtonItem
-              disabled={busy || !selectedCountry}
-              onClick={() => {
-                if (!selected || !selectedCountry) {
-                  return;
-                }
-                void runAction(
-                  () => connectCountry(selectedCountry),
-                  `${status.connected ? "Switching to" : "Connecting to"} ${selected.name}`,
-                );
-              }}
-            >
-              {status.connected ? `Switch to ${selected?.name ?? "country"}` : `Connect to ${selected?.name ?? "country"}`}
-            </ButtonItem>
-          </PanelSectionRow>
-          {status.connected && (
-            <PanelSectionRow>
-              <ButtonItem
-                disabled={busy}
-                onClick={() =>
-                  void runAction(disconnect, "Disconnected through Proton VPN CLI")
-                }
-              >
-                Disconnect
-              </ButtonItem>
-            </PanelSectionRow>
-          )}
-        </PanelSection>
-      )}
-    </>
+  return (
+    <div className="protonvpn-tabs" style={{ height: "100%", minHeight: 0, maxWidth: "100%" }}>
+      <style>{`.protonvpn-tabs [role="tabpanel"] { min-height: 0; overflow-y: auto; scroll-padding-block: 8px; }`}</style>
+      <Tabs activeTab={activeTab} onShowTab={changeTab} tabs={[
+        { id: "connection", title: <span role="img" aria-label="Connection" title="Connection"><FaExchangeAlt size={20} aria-hidden="true" style={{ display: "block" }} /></span>, content: connectionView },
+        { id: "settings", title: <span role="img" aria-label="Settings" title="Settings"><FaSlidersH size={20} aria-hidden="true" style={{ display: "block" }} /></span>, content: settingsView },
+        { id: "account", title: <span role="img" aria-label="Account" title="Account"><FaUser size={20} aria-hidden="true" style={{ display: "block" }} /></span>, content: accountView },
+      ]} />
+    </div>
   );
 }
 
@@ -399,5 +471,5 @@ export default definePlugin(() => ({
   name: "Proton VPN",
   titleView: <div className={staticClasses.Title}>Proton VPN</div>,
   content: <Content />,
-  icon: <FaShieldAlt />,
+  icon: <ProtonIcon />,
 }));
