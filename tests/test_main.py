@@ -1,5 +1,8 @@
 import asyncio
 import base64
+import builtins
+import hashlib
+import inspect
 import io
 import json
 import logging
@@ -12,6 +15,7 @@ import traceback
 import types
 import unittest
 from contextlib import redirect_stdout
+from concurrent.futures import Future
 from importlib import metadata
 from pathlib import Path
 from unittest.mock import Mock, call, patch
@@ -21,7 +25,371 @@ sys.modules.setdefault("decky", types.ModuleType("decky"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "py_modules"))
 
 import main
-from protonvpn import keyring, proton_cli
+from protonvpn import cli_compat, keyring, proton_cli
+
+
+class KeyringReadTests(unittest.TestCase):
+    def setUp(self):
+        class Backend:
+            KEYRING_SERVICE = "ProtonVPN"
+
+            def _get_item(self, key):
+                raise AssertionError("Unpatched implementation")
+
+        class LockedError(RuntimeError):
+            pass
+
+        self.original = Backend._get_item
+        self.module = types.SimpleNamespace(
+            KeyringBackendLinuxSecretService=Backend,
+            keyring=types.SimpleNamespace(errors=types.SimpleNamespace(KeyringLocked=LockedError, KeyringError=RuntimeError)),
+            KeyringLocked=LockedError, KeyringError=RuntimeError,
+        )
+        self.backend = Backend()
+        self.backend._backend = Mock()
+        self.backend._del_item = Mock()
+        digest = hashlib.sha256(inspect.getsource(self.original).encode()).hexdigest()
+        with patch.object(cli_compat, "UPSTREAM_KEYRING_GET_SHA256", digest):
+            self.assertTrue(cli_compat.install_keyring_read_fix(self.module))
+
+    def test_valid_json_and_existing_newline_workaround(self):
+        for value, expected in (('["account"]', ["account"]), ('{"text":"first\nsecond"}', {"text": "first\nsecond"})):
+            with self.subTest(value=value):
+                self.backend._backend.get_password.return_value = value
+                self.assertEqual(self.backend._get_item("proton-sso-accounts"), expected)
+                self.backend._del_item.assert_not_called()
+
+    def test_malformed_or_empty_read_never_deletes_credentials(self):
+        for value in ("", "private-invalid-data", "{truncated"):
+            with self.subTest(value=value):
+                self.backend._backend.get_password.return_value = value
+                with self.assertRaisesRegex(RuntimeError, "saved credentials were not changed") as raised:
+                    self.backend._get_item("proton-sso-accounts")
+                self.assertNotIn("private-invalid-data", str(raised.exception))
+                self.backend._del_item.assert_not_called()
+
+    def test_missing_item_remains_missing(self):
+        self.backend._backend.get_password.return_value = None
+        with self.assertRaises(KeyError):
+            self.backend._get_item("missing")
+        self.backend._del_item.assert_not_called()
+
+    def test_locked_and_failed_reads_propagate_without_deletion(self):
+        for error in (self.module.KeyringLocked("private-data"), RuntimeError("private-data")):
+            with self.subTest(error=type(error)):
+                self.backend._backend.get_password.side_effect = error
+                with self.assertRaises(type(error)) as raised:
+                    self.backend._get_item("proton-sso-accounts")
+                self.assertNotIn("private-data", str(raised.exception))
+                self.backend._del_item.assert_not_called()
+
+    def test_unknown_source_is_not_replaced(self):
+        self.module.KeyringBackendLinuxSecretService._get_item = self.original
+        self.assertFalse(cli_compat.install_keyring_read_fix(self.module))
+        self.assertIs(self.module.KeyringBackendLinuxSecretService._get_item, self.original)
+        with patch.object(cli_compat.inspect, "getsource", side_effect=OSError):
+            self.assertFalse(cli_compat.install_keyring_read_fix(self.module))
+
+    def test_launcher_requires_guard_before_running_cli(self):
+        original_import = builtins.__import__
+
+        def import_backend(name, *arguments, **kwargs):
+            if name == "proton.keyring_linux.secretservice":
+                return types.SimpleNamespace(secretservice_backend=self.module)
+            if name.startswith("proton.vpn"):
+                raise AssertionError("Read-only operation imported network backend")
+            return original_import(name, *arguments, **kwargs)
+
+        for supported in (False, True):
+            with (
+                self.subTest(supported=supported),
+                patch.object(builtins, "__import__", side_effect=import_backend),
+                patch.object(cli_compat, "install_keyring_read_fix", return_value=supported) as guard,
+                patch.object(cli_compat.sys, "argv", ["launcher", "info"]),
+                patch.object(cli_compat.runpy, "run_path") as run,
+            ):
+                if supported:
+                    cli_compat.main()
+                    run.assert_called_once_with("/app/bin/protonvpn", run_name="__main__")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "no CLI command was run"):
+                        cli_compat.main()
+                    run.assert_not_called()
+                guard.assert_called_once_with(self.module)
+
+
+class ReliabilityTests(unittest.TestCase):
+    def test_signin_uses_guard_without_putting_password_in_arguments(self):
+        with (
+            patch.object(keyring, "ensure_service"),
+            patch.object(main.decky, "logger", create=True),
+            patch.object(main, "_get_status", return_value={"signed_in": True}),
+            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+        ):
+            main._run_cli_signin({"username": "test-user", "password": "private-password", "totp": ""})
+        command = run.call_args.args[0]
+        self.assertEqual(command, proton_cli.cli_command(["signin", "--totp", "--", "test-user"]))
+        self.assertNotIn("private-password", " ".join(command))
+        self.assertEqual(run.call_args.kwargs["input"], "private-password\n\n")
+
+    def test_failed_wallet_start_prevents_account_reads(self):
+        with (
+            patch.object(proton_cli, "flatpak_installed", return_value=True),
+            patch.object(keyring, "ensure_service", side_effect=RuntimeError("Wallet unavailable")),
+            patch.object(proton_cli, "signed_in") as account,
+        ):
+            result = main._get_cli_status()
+        self.assertIsNone(result["signed_in"])
+        self.assertEqual(result["error"], "Wallet unavailable")
+        account.assert_not_called()
+
+    def test_account_operations_prepare_wallet_before_account_read(self):
+        for operation in (main._get_cli_status, main._get_countries, main._disconnect):
+            calls = Mock()
+            calls.account.return_value = True
+            with (
+                self.subTest(operation=operation.__name__),
+                patch.object(proton_cli, "flatpak_installed", return_value=True),
+                patch.object(keyring, "ensure_service", side_effect=calls.wallet),
+                patch.object(proton_cli, "signed_in", side_effect=calls.account),
+                patch.object(proton_cli, "run_cli", return_value="Status: Disconnected"),
+                patch.object(main, "_get_status", return_value={}),
+            ):
+                operation()
+            self.assertEqual(calls.mock_calls[:2], [call.wallet(), call.account()])
+
+    def test_active_tunnel_remains_visible_when_keyring_fails(self):
+        with (
+            patch.object(proton_cli, "tunnel_active", return_value=True),
+            patch.object(main, "_get_cli_status", return_value={"connected": None, "signed_in": None, "error": "Keyring unavailable"}),
+        ):
+            result = main._get_status()
+        self.assertTrue(result["tunnel_active"])
+        self.assertIsNone(result["connected"])
+        self.assertEqual(result["error"], "Keyring unavailable")
+
+    def test_status_reports_both_mismatch_directions(self):
+        for active in (True, False):
+            with (
+                self.subTest(active=active),
+                patch.object(proton_cli, "tunnel_active", return_value=active),
+                patch.object(main, "_get_cli_status", return_value={"connected": not active, "signed_in": True}),
+            ):
+                result = main._get_status()
+            self.assertIs(result["tunnel_active"], active)
+            self.assertIsNone(result["connected"])
+            self.assertIn("error", result)
+
+    def test_tunnel_probe_is_bounded_and_ignores_unrelated_interfaces(self):
+        for output, expected in (("wireguard:proton0\n", True), ("802-11-wireless:wlan0\nwireguard:other\n", False)):
+            with self.subTest(output=output), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")) as run:
+                self.assertIs(proton_cli.tunnel_active(), expected)
+                self.assertEqual(run.call_args.args[0], ["/usr/bin/nmcli", "-t", "-f", "TYPE,DEVICE", "connection", "show", "--active"])
+                self.assertEqual(run.call_args.kwargs["timeout"], 5)
+                self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        for failure in (OSError("private-data"), subprocess.TimeoutExpired([], 5)):
+            with patch.object(subprocess, "run", side_effect=failure):
+                self.assertIsNone(proton_cli.tunnel_active())
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "private-data")):
+            self.assertIsNone(proton_cli.tunnel_active())
+
+
+class RouteSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        class Client:
+            _assert_running_on_glib_loop_thread = Mock()
+
+            @classmethod
+            def _apply_connection_async(cls, active_connection, future):
+                raise AssertionError("Unpatched implementation")
+
+        self.client = Client
+        self.original = Client._apply_connection_async
+        self.source = inspect.getsource(self.original)
+        self.nm = Mock()
+        self.connection = Mock(routes=[])
+        self.device = Mock()
+        self.active = Mock()
+        self.active.get_connection.return_value = self.connection
+        self.active.get_devices.return_value = [self.device]
+        self.nm.SimpleConnection.new_clone.side_effect = lambda connection: types.SimpleNamespace(routes=list(connection.routes))
+        self.future = Future()
+
+    def install(self):
+        with patch.object(cli_compat, "UPSTREAM_ROUTE_APPLY_SHA256", hashlib.sha256(self.source.encode()).hexdigest()):
+            self.assertTrue(cli_compat.install_route_snapshot_fix(self.client, self.nm))
+
+    def commit(self):
+        callback = self.connection.commit_changes_async.call_args.kwargs["callback"]
+        callback(self.connection, object())
+
+    def test_snapshot_survives_callback_configuration_replacement(self):
+        self.install()
+        for requested, stale in ((["endpoint"], []), ([], ["endpoint"])):
+            with self.subTest(requested=requested):
+                self.future = Future()
+                self.connection.routes = list(requested)
+                self.client._apply_connection_async(self.active, self.future)
+                self.connection.routes[:] = stale
+                self.commit()
+                arguments = self.device.reapply_async.call_args
+                self.assertEqual(arguments.args[0].routes, requested)
+                self.assertEqual(arguments.kwargs["version_id"], 0)
+                self.assertEqual(arguments.kwargs["flags"], 0)
+                self.assertIsNone(arguments.kwargs["cancellable"])
+                self.assertFalse(self.future.done())
+                arguments.kwargs["callback"](self.device, object())
+                self.assertIsNone(self.future.result(timeout=0))
+        self.connection.commit_changes_async.assert_called_with(
+            save_to_disk=False, cancellable=None,
+            callback=self.connection.commit_changes_async.call_args.kwargs["callback"],
+        )
+        self.assertEqual(self.client._assert_running_on_glib_loop_thread.call_count, 2)
+
+    def test_commit_failure_prevents_reapply(self):
+        self.install()
+        error = RuntimeError("commit failed")
+        self.connection.commit_changes_finish.side_effect = error
+        self.client._apply_connection_async(self.active, self.future)
+        self.commit()
+        self.assertIs(self.future.exception(timeout=0), error)
+        self.device.reapply_async.assert_not_called()
+
+    def test_reapply_failures_propagate(self):
+        self.install()
+        for method in ("reapply_async", "reapply_finish"):
+            with self.subTest(method=method):
+                self.future = Future()
+                self.device.reset_mock(side_effect=True)
+                error = RuntimeError("reapply failed")
+                getattr(self.device, method).side_effect = error
+                self.client._apply_connection_async(self.active, self.future)
+                self.commit()
+                if method == "reapply_finish":
+                    self.device.reapply_async.call_args.kwargs["callback"](self.device, object())
+                self.assertIs(self.future.exception(timeout=0), error)
+
+    def test_unknown_or_unreadable_implementation_is_unchanged(self):
+        self.assertFalse(cli_compat.install_route_snapshot_fix(self.client, self.nm))
+        self.assertEqual(self.client._apply_connection_async, self.original)
+        with patch.object(cli_compat.inspect, "getsource", side_effect=OSError):
+            self.assertFalse(cli_compat.install_route_snapshot_fix(self.client, self.nm))
+        self.assertEqual(self.client._apply_connection_async, self.original)
+        self.nm.SimpleConnection.new_clone.assert_not_called()
+
+    def test_all_commands_use_guard_and_only_network_uses_service(self):
+        launcher = Path(cli_compat.__file__).read_text(encoding="utf-8")
+        for arguments in (["connect"], ["connect", "--country", "US"], ["disconnect"], ["status"], ["info"], ["countries", "list"]):
+            with self.subTest(arguments=arguments), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok", "")) as run:
+                self.assertEqual(proton_cli.run_cli(arguments), "ok")
+                expected = (
+                    [
+                        "/usr/bin/systemd-run", "--user", "--wait", "--pipe", "--collect", "--quiet",
+                        "--unit=decky-protonvpn-network", "--expand-environment=no",
+                        "--property=Type=exec", "--property=Restart=no",
+                        f"--property=RuntimeMaxSec={proton_cli.CLI_TIMEOUT_SECONDS - 5}s",
+                        "--property=TimeoutStopSec=3s", "--property=KillMode=control-group",
+                        "--property=UnsetEnvironment=LD_LIBRARY_PATH LD_PRELOAD",
+                        "--setenv=LC_ALL=C", f"--setenv=XDG_RUNTIME_DIR=/run/user/{os.getuid()}",
+                        f"--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{os.getuid()}/bus",
+                        "--", proton_cli.FLATPAK, "run", "--command=python3", proton_cli.PROTON_APP_ID, "-c", launcher, *arguments,
+                    ]
+                    if arguments[0] in ("connect", "disconnect")
+                    else [proton_cli.FLATPAK, "run", "--command=python3", proton_cli.PROTON_APP_ID, "-c", launcher, *arguments]
+                )
+                self.assertEqual(run.call_args.args[0], expected)
+                self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+                self.assertEqual(run.call_args.kwargs["timeout"], proton_cli.CLI_TIMEOUT_SECONDS)
+                run.assert_called_once()
+
+    def test_network_commands_refuse_root_or_nonstandard_user_bus(self):
+        for arguments in (["connect"], ["disconnect"]):
+            with self.subTest(arguments=arguments), patch.object(os, "getuid", return_value=0), patch.object(subprocess, "run") as run:
+                with self.assertRaisesRegex(RuntimeError, "not root"):
+                    proton_cli.run_cli(arguments)
+                run.assert_not_called()
+            for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+                environment = proton_cli.cli_environment()
+                environment[name] = "nonstandard"
+                with self.subTest(arguments=arguments, name=name), patch.object(proton_cli, "cli_environment", return_value=environment), patch.object(subprocess, "run") as run:
+                    with self.assertRaisesRegex(RuntimeError, "standard user bus"):
+                        proton_cli.run_cli(arguments)
+                    run.assert_not_called()
+
+    def test_launcher_failure_is_sanitized_without_retry(self):
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "private-data", "NetworkManager private-data")) as run:
+            with self.assertRaises(proton_cli.CLICommandError) as raised:
+                proton_cli.run_cli(["connect"])
+        self.assertNotIn("private-data", str(raised.exception))
+        run.assert_called_once()
+
+
+class DisconnectCleanupTests(unittest.TestCase):
+    def setUp(self):
+        async def original(timeout=10):
+            raise AssertionError("Unpatched implementation")
+
+        self.original = original
+        self.server = types.SimpleNamespace(wait_for_current_tasks=original)
+
+    def install(self):
+        digest = hashlib.sha256(inspect.getsource(self.original).encode()).hexdigest()
+        with patch.object(cli_compat, "UPSTREAM_TASK_WAIT_SHA256", digest):
+            self.assertTrue(cli_compat.install_disconnect_cleanup_fix(self.server))
+
+    def test_cancelled_background_task_does_not_fail_cleanup(self):
+        self.install()
+
+        async def scenario():
+            background = asyncio.create_task(asyncio.Event().wait())
+            background.cancel()
+            await self.server.wait_for_current_tasks()
+            self.assertTrue(background.cancelled())
+
+        asyncio.run(scenario())
+
+    def test_real_background_failure_is_not_suppressed(self):
+        self.install()
+
+        async def failure():
+            raise RuntimeError("background failed")
+
+        async def scenario():
+            background = asyncio.create_task(failure())
+            with self.assertRaisesRegex(RuntimeError, "background failed"):
+                await self.server.wait_for_current_tasks()
+            self.assertTrue(background.done())
+
+        asyncio.run(scenario())
+
+    def test_cleanup_timeout_is_not_suppressed(self):
+        self.install()
+
+        async def scenario():
+            background = asyncio.create_task(asyncio.Event().wait())
+            with self.assertRaises(asyncio.TimeoutError):
+                await self.server.wait_for_current_tasks(timeout=0)
+            self.assertTrue(background.cancelled())
+
+        asyncio.run(scenario())
+
+    def test_cancelling_the_command_still_propagates(self):
+        self.install()
+
+        async def scenario():
+            background = asyncio.create_task(asyncio.Event().wait())
+            asyncio.get_running_loop().call_soon(asyncio.current_task().cancel)
+            with self.assertRaises(asyncio.CancelledError):
+                await self.server.wait_for_current_tasks()
+            self.assertTrue(background.cancelled())
+
+        asyncio.run(scenario())
+
+    def test_unknown_or_unreadable_wait_is_unchanged(self):
+        self.assertFalse(cli_compat.install_disconnect_cleanup_fix(self.server))
+        with patch.object(cli_compat.inspect, "getsource", side_effect=OSError):
+            self.assertFalse(cli_compat.install_disconnect_cleanup_fix(self.server))
+        self.assertIs(self.server.wait_for_current_tasks, self.original)
 
 
 class BackendPackagingTests(unittest.TestCase):
@@ -58,7 +426,172 @@ assert module.proton_cli is proton_cli
             )
 
 
+class SteamDisplayTests(unittest.TestCase):
+    def test_discovery_fails_closed_when_scan_is_incomplete(self):
+        with patch.object(os, "scandir") as scan, patch.object(keyring.time, "monotonic", return_value=0):
+            scan.return_value.__enter__.return_value = iter([types.SimpleNamespace(name="self")] * 4097)
+            with self.assertRaisesRegex(RuntimeError, "limit reached"):
+                keyring.steam_display_environment()
+        with patch.object(os, "scandir") as scan, patch.object(keyring.time, "monotonic", side_effect=[0, 3]):
+            scan.return_value.__enter__.return_value = iter([types.SimpleNamespace(name="42")])
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                keyring.steam_display_environment()
+        with patch.object(os, "scandir", side_effect=PermissionError("private-data")):
+            with self.assertRaisesRegex(RuntimeError, "discovery is unavailable") as raised:
+                keyring.steam_display_environment()
+            self.assertNotIn("private-data", str(raised.exception))
+
+    def test_reads_only_display_settings_from_the_users_steam_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = root / "42"
+            process.mkdir()
+            (process / "comm").write_text("steam\n")
+            authority = root / "authority"
+            authority.touch()
+            (process / "environ").write_bytes(
+                f"DISPLAY=:2\0XAUTHORITY={authority}\0TOKEN=private-data\0QT_QPA_PLATFORM=offscreen\0".encode()
+            )
+            with patch.object(Path, "is_socket", return_value=True) as socket_check:
+                self.assertEqual(keyring.steam_display_environment(root), {"DISPLAY": ":2", "XAUTHORITY": str(authority)})
+                socket_check.assert_called_once_with()
+
+    def test_refuses_missing_stale_remote_and_ambiguous_displays(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = root / "42"
+            process.mkdir()
+            (process / "comm").write_text("steam\n")
+            for raw in (b"TOKEN=private-data\0", b"DISPLAY=host:0\0", b"DISPLAY=:0\0XAUTHORITY=relative\0", b"DISPLAY=:0\0" + b"x" * 131073):
+                (process / "environ").write_bytes(raw)
+                with self.subTest(raw=raw[:20]), patch.object(Path, "is_socket", return_value=True):
+                    with self.assertRaisesRegex(RuntimeError, "No usable Steam display"):
+                        keyring.steam_display_environment(root)
+            (process / "environ").write_bytes(b"DISPLAY=:0\0")
+            with patch.object(Path, "is_socket", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "No usable Steam display"):
+                    keyring.steam_display_environment(root)
+            with patch.object(Path, "is_socket", return_value=True):
+                self.assertEqual(keyring.steam_display_environment(root), {"DISPLAY": ":0"})
+            other = root / "43"
+            other.mkdir()
+            (other / "comm").write_text("steam\n")
+            (other / "environ").write_bytes(b"DISPLAY=:1\0")
+            with patch.object(Path, "is_socket", return_value=True):
+                with self.assertRaisesRegex(RuntimeError, "Multiple Steam displays"):
+                    keyring.steam_display_environment(root)
+
+    def test_ignores_other_users_and_other_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = root / "42"
+            process.mkdir()
+            (process / "comm").write_text("steam\n")
+            (process / "environ").write_bytes(b"DISPLAY=:0\0")
+            with patch.object(os, "getuid", return_value=os.getuid() + 1):
+                with self.assertRaisesRegex(RuntimeError, "No usable Steam display"):
+                    keyring.steam_display_environment(root)
+            (process / "comm").write_text("other\n")
+            with self.assertRaisesRegex(RuntimeError, "No usable Steam display"):
+                keyring.steam_display_environment(root)
+
+
 class KeyringServiceTests(unittest.TestCase):
+    def setUp(self):
+        logger = patch.object(main.decky, "logger", create=True)
+        self.logger = logger.start()
+        self.addCleanup(logger.stop)
+
+    def test_kde_launch_uses_scoped_display_and_preserves_global_environment(self):
+        environment = {"XDG_RUNTIME_DIR": "/run/user/1000", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus", "DISPLAY": ":99"}
+        before = dict(environment)
+        with (
+            patch.object(os, "getuid", return_value=1000),
+            patch.object(proton_cli, "cli_environment", return_value=environment),
+            patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+        ):
+            keyring.start_kde_service({"DISPLAY": ":2", "XAUTHORITY": "/user/authority", "TOKEN": "private-data"})
+        command = run.call_args.args[0]
+        self.assertEqual(command[:4], [keyring.SYSTEMD_RUN, "--user", "--collect", "--quiet"])
+        self.assertEqual(command[-1], keyring.KSECRET_SERVICE)
+        for argument in ("--setenv=DISPLAY=:2", "--setenv=XAUTHORITY=/user/authority", "--setenv=QT_QPA_PLATFORM=xcb", "--property=Type=dbus", "--property=BusName=org.freedesktop.secrets", "--property=TimeoutStartSec=10s", "--property=Restart=no"):
+            self.assertIn(argument, command)
+        self.assertNotIn("private-data", str(run.call_args))
+        self.assertNotIn("offscreen", str(run.call_args))
+        self.assertEqual(run.call_args.kwargs["timeout"], 15)
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(environment, before)
+
+    def test_kde_launch_refuses_root_custom_bus_and_redacts_failures(self):
+        with patch.object(os, "getuid", return_value=0), patch.object(subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "not root"):
+                keyring.start_kde_service({"DISPLAY": ":0"})
+            run.assert_not_called()
+        with patch.object(os, "getuid", return_value=1000), patch.object(proton_cli, "cli_environment", return_value={}), patch.object(subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "standard user bus"):
+                keyring.start_kde_service({"DISPLAY": ":0"})
+            run.assert_not_called()
+        environment = {"XDG_RUNTIME_DIR": "/run/user/1000", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"}
+        for failure in (OSError("private-data"), subprocess.TimeoutExpired([], 15, output="private-data"), None):
+            with (
+                self.subTest(failure=type(failure).__name__),
+                patch.object(os, "getuid", return_value=1000),
+                patch.object(proton_cli, "cli_environment", return_value=environment),
+                patch.object(subprocess, "run", side_effect=failure, return_value=subprocess.CompletedProcess([], 1, "private-data", "private-data")) as run,
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    keyring.start_kde_service({"DISPLAY": ":0"})
+                self.assertNotIn("private-data", str(raised.exception))
+                self.assertIn("XAUTHORITY", next(argument for argument in run.call_args.args[0] if argument.startswith("--property=UnsetEnvironment=")))
+
+    def test_kde_activation_uses_steam_display_instead_of_broken_dbus_startup(self):
+        with (
+            patch.object(os, "getuid", return_value=1000),
+            patch.object(keyring, "user_bus_call", side_effect=[set(), {"org.kde.secretservicecompat"}]) as bus,
+            patch.object(keyring, "steam_display_environment", return_value={"DISPLAY": ":2"}),
+            patch.object(keyring, "start_kde_service") as start,
+            patch.object(main, "_get_status", return_value={"signed_in": True, "connected": False}) as verify,
+        ):
+            result = main._start_keyring_service()
+        start.assert_called_once_with({"DISPLAY": ":2"})
+        verify.assert_called_once_with()
+        self.assertEqual(bus.call_count, 2)
+        self.assertNotIn("error", result)
+        self.assertIn("startup completed", result["diagnostics"]["Keyring activation stage"])
+        self.logger.info.assert_called_once()
+
+    def test_missing_display_does_not_launch_kde_or_fall_back_to_crashing_activation(self):
+        with (
+            patch.object(os, "getuid", return_value=1000),
+            patch.object(keyring, "user_bus_call", side_effect=[set(), {"org.kde.secretservicecompat"}]) as bus,
+            patch.object(keyring, "steam_display_environment", side_effect=RuntimeError("No usable Steam display")),
+            patch.object(keyring, "start_kde_service") as start,
+        ):
+            failure, report = keyring.start_service()
+        self.assertEqual(failure, "No usable Steam display")
+        self.assertEqual(report["Keyring activation stage"], "finding Steam display")
+        self.assertIn("not attempted", report["KDE startup log"])
+        start.assert_not_called()
+        self.assertEqual(bus.call_count, 2)
+
+    def test_failed_scoped_kde_launch_keeps_startup_evidence_and_does_not_retry(self):
+        with (
+            patch.object(os, "getuid", return_value=1000),
+            patch.object(keyring, "user_bus_call", side_effect=[set(), {"org.kde.secretservicecompat"}]) as bus,
+            patch.object(keyring, "steam_display_environment", return_value={"DISPLAY": ":2"}),
+            patch.object(keyring, "start_kde_service", side_effect=RuntimeError("KDE startup failed")) as start,
+            patch.object(keyring, "startup_diagnostics", return_value={"KDE startup log": "Qt could not connect to a display"}),
+            patch.object(main, "_get_status", return_value={"signed_in": True, "connected": None, "error": "Secret Service unavailable"}),
+        ):
+            result = main._start_keyring_service()
+        self.assertEqual(result["error"], "KDE startup failed")
+        self.assertTrue(result["signed_in"])
+        self.assertEqual(result["diagnostics"]["Keyring activation stage"], "starting KDE on Steam display")
+        self.assertEqual(result["diagnostics"]["KDE startup log"], "Qt could not connect to a display")
+        self.assertIn("Qt could not connect", str(self.logger.info.call_args))
+        start.assert_called_once_with({"DISPLAY": ":2"})
+        self.assertEqual(bus.call_count, 2)
+
     def test_startup_log_is_scoped_bounded_and_only_reports_fixed_findings(self):
         output = "\n".join(json.dumps({"MESSAGE": message, "_HOSTNAME": "private-data"}) for message in (
             "qt.qpa.xcb: could not connect to display private-data",
@@ -183,7 +716,7 @@ class KeyringServiceTests(unittest.TestCase):
                     self.assertEqual(command[-3:], ["su", "org.kde.kwalletd6", "0"])
 
     def test_activation_uses_existing_provider_and_verifies_proton(self):
-        for service in ("org.kde.secretservicecompat", "org.kde.kwalletd6", "org.kde.kwalletd5", "org.gnome.keyring", "org.freedesktop.secrets"):
+        for service in ("org.kde.kwalletd6", "org.kde.kwalletd5", "org.gnome.keyring", "org.freedesktop.secrets"):
             status = {"installed": True, "signed_in": True, "connected": False}
             with (
                 self.subTest(service=service),
@@ -263,6 +796,11 @@ class KeyringServiceTests(unittest.TestCase):
 
 
 class KeyringDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        for mocked in (patch.object(keyring, "ensure_service"), patch.object(proton_cli, "tunnel_active", return_value=None)):
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
     def run_probe(self, *, names=None, activatable=None, locked=False, collection_error=None, bus_error=None):
         storage = types.ModuleType("secretstorage")
         storage.ItemNotFoundException = type("ItemNotFoundException", (Exception,), {})
@@ -412,6 +950,15 @@ class KeyringDiagnosticTests(unittest.TestCase):
 
 
 class ProtonCLITests(unittest.TestCase):
+    def setUp(self):
+        for mocked in (
+            patch.object(keyring, "ensure_service", wraps=keyring.ensure_service),
+            patch.object(keyring, "user_bus_call", return_value=["org.freedesktop.secrets"]),
+            patch.object(proton_cli, "tunnel_active", return_value=None),
+        ):
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
     def test_keyring_metadata_and_exception_identifiers_are_allowlisted(self):
         output = json.dumps({"drivers": ["json", "secret_service"], "cli_version": "1.2.3", "keyring_version": "private-data"})
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, "")):
@@ -656,7 +1203,7 @@ class ProtonCLITests(unittest.TestCase):
             status = main._get_status()
 
         self.assertFalse(status["signed_in"])
-        self.assertFalse(status["connected"])
+        self.assertIsNone(status["connected"])
 
     def test_missing_app_returns_install_guidance_state(self):
         with (
@@ -690,13 +1237,40 @@ class ProtonCLITests(unittest.TestCase):
                 "_get_countries",
                 return_value={"signed_in": True, "countries": [{"name": "Canada", "code": "CA"}]},
             ),
-            patch.object(proton_cli, "run_cli") as run_cli,
+            patch.object(keyring, "start_service", return_value=(None, {})) as start,
+            patch.object(proton_cli, "run_cli", side_effect=lambda arguments: self.assertTrue(start.called)) as run_cli,
             patch.object(main, "_get_status", return_value={"connected": True}),
         ):
             result = main._connect_country("CA")
 
+        start.assert_called_once_with()
         run_cli.assert_called_once_with(["connect", "--country", "CA"])
         self.assertTrue(result["connected"])
+
+    def test_connect_country_failure_does_not_retry(self):
+        failure = proton_cli.CLICommandError("Proton VPN connection failed: Secret Service unavailable (exit 1)", "Secret Service unavailable")
+        with (
+            patch.object(main, "_get_countries", return_value={"signed_in": True, "countries": [{"name": "United States", "code": "US"}]}),
+            patch.object(keyring, "start_service", return_value=(None, {})) as start,
+            patch.object(proton_cli, "run_cli", side_effect=failure) as run_cli,
+        ):
+            result = asyncio.run(main.Plugin().connect_country("US"))
+        self.assertEqual(result["error"], str(failure))
+        self.assertIsNone(result["connected"])
+        start.assert_called_once_with()
+        run_cli.assert_called_once_with(["connect", "--country", "US"])
+
+    def test_connect_country_keyring_failure_prevents_connection(self):
+        with (
+            patch.object(main, "_get_countries", return_value={"signed_in": True, "countries": [{"name": "United States", "code": "US"}]}),
+            patch.object(keyring, "start_service", return_value=("No usable Steam display", {})) as start,
+            patch.object(proton_cli, "run_cli") as run_cli,
+        ):
+            result = asyncio.run(main.Plugin().connect_country("US"))
+        self.assertIn("keyring startup failed: No usable Steam display", result["error"])
+        self.assertIsNone(result["connected"])
+        start.assert_called_once_with()
+        run_cli.assert_not_called()
 
     def test_connect_country_rejects_unknown_code(self):
         with (
@@ -705,12 +1279,14 @@ class ProtonCLITests(unittest.TestCase):
                 "_get_countries",
                 return_value={"signed_in": True, "countries": [{"name": "Canada", "code": "CA"}]},
             ),
+            patch.object(keyring, "start_service") as start,
             patch.object(proton_cli, "run_cli") as run_cli,
         ):
             with self.assertRaisesRegex(ValueError, "available country list"):
                 main._connect_country("US")
 
         run_cli.assert_not_called()
+        start.assert_not_called()
 
     def test_disconnect_uses_proton_cli(self):
         with (
@@ -724,8 +1300,84 @@ class ProtonCLITests(unittest.TestCase):
         run_cli.assert_called_once_with(["disconnect"])
         self.assertFalse(result["connected"])
 
+    def test_connection_rpcs_return_expected_errors_without_asserting_state(self):
+        plugin = main.Plugin()
+        for method, target, arguments in (
+            (plugin.connect_country, "_connect_country", ("US",)),
+            (plugin.disconnect, "_disconnect", ()),
+        ):
+            for failure in (
+                ValueError("Choose a valid Proton VPN country"),
+                proton_cli.CLICommandError("Proton VPN connection failed: Secret Service unavailable (exit 1)", "Secret Service unavailable"),
+                RuntimeError("Proton VPN connection timed out; refresh status before retrying"),
+            ):
+                with self.subTest(target=target, error=str(failure)), patch.object(main, target, side_effect=failure) as action:
+                    result = asyncio.run(method(*arguments))
+                self.assertEqual(result, {"installed": None, "signed_in": None, "connected": None, "error": str(failure)})
+                action.assert_called_once_with(*arguments)
+                self.assertFalse(main.CLI_OPERATION_LOCK.locked())
+
+    def test_connection_rpcs_do_not_retry_when_an_operation_is_busy(self):
+        plugin = main.Plugin()
+        with patch.object(main, "_connect_country") as connect, patch.object(main, "_disconnect") as disconnect:
+            with main.CLI_OPERATION_LOCK:
+                results = (asyncio.run(plugin.connect_country("US")), asyncio.run(plugin.disconnect()))
+        for result in results:
+            self.assertIn("in progress", result["error"])
+            self.assertIsNone(result["connected"])
+        connect.assert_not_called()
+        disconnect.assert_not_called()
+
+    def test_connection_rpcs_preserve_successful_results(self):
+        plugin = main.Plugin()
+        for method, target, arguments, connected in (
+            (plugin.connect_country, "_connect_country", ("US",), True),
+            (plugin.disconnect, "_disconnect", (), False),
+        ):
+            expected = {"installed": True, "signed_in": True, "connected": connected}
+            with self.subTest(target=target), patch.object(main, target, return_value=expected):
+                self.assertEqual(asyncio.run(method(*arguments)), expected)
+
 
 class SignInTests(unittest.TestCase):
+    def test_signin_prepares_keyring_before_submitting_credentials(self):
+        def run_cli(*arguments, **options):
+            self.keyring_start.assert_called_once_with()
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with (
+            patch.object(subprocess, "run", side_effect=run_cli),
+            patch.object(main, "_get_status", return_value={"signed_in": True}),
+        ):
+            self.assertTrue(main._run_cli_signin({"username": "user", "password": "private-password", "totp": ""})["signed_in"])
+        self.assertNotIn("private-password", str(self.logger.info.call_args_list))
+        self.logger.info.assert_any_call("Proton VPN sign-in: CLI returned; exit=%d", 0)
+
+    def test_signin_keyring_failure_prevents_credential_submission(self):
+        self.keyring_start.return_value = ("No usable Steam display", {})
+        with patch.object(subprocess, "run") as run_cli:
+            with self.assertRaisesRegex(RuntimeError, "keyring startup failed: No usable Steam display"):
+                main._run_cli_signin({"username": "user", "password": "private-password", "totp": ""})
+        run_cli.assert_not_called()
+        self.assertNotIn("private-password", str(self.logger.info.call_args_list))
+
+    def test_signin_reports_sanitized_cli_category(self):
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "KeyringLocked private-password")):
+            with self.assertRaisesRegex(RuntimeError, r"sign-in failed: keyring locked \(exit 1\)"):
+                main._run_cli_signin({"username": "user", "password": "private-password", "totp": ""})
+        self.assertNotIn("private-password", str(self.logger.info.call_args_list))
+
+    def test_signin_zero_exit_without_verified_account_is_not_silent(self):
+        for signed_in in (False, None):
+            with (
+                self.subTest(signed_in=signed_in),
+                patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")),
+                patch.object(main, "_get_status", return_value={"installed": True, "signed_in": signed_in, "connected": False}),
+            ):
+                result = main._run_cli_signin({"username": "user", "password": "secret", "totp": ""})
+            self.assertIn("without completing sign-in", result["error"])
+            self.assertIs(result["signed_in"], signed_in)
+
     def test_signin_success_is_not_reported_as_failed_authentication(self):
         with (
             patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")),
@@ -744,8 +1396,37 @@ class SignInTests(unittest.TestCase):
             self.assertEqual(asyncio.run(plugin.complete_signin("session", "ciphertext")), {"error": "already signed in"})
         with patch.object(main, "_complete_signin", side_effect=ValueError("expired")):
             self.assertEqual(asyncio.run(plugin.complete_signin("session", "ciphertext")), {"error": "expired"})
+        self.assertIn("failed", str(self.logger.info.call_args_list))
+        self.assertNotIn("session unavailable", str(self.logger.info.call_args_list))
+        self.assertNotIn("expired", str(self.logger.info.call_args_list))
+
+    def test_signin_stage_logging_excludes_payloads_and_session_material(self):
+        plugin = main.Plugin()
+        session = {"session_id": "private-session", "public_key": "private-public-key"}
+        with (
+            patch.object(main, "_begin_signin", return_value=session),
+            patch.object(main, "_complete_signin", return_value={"signed_in": True}),
+            patch.object(main, "_cancel_signin"),
+        ):
+            self.assertEqual(asyncio.run(plugin.begin_signin()), session)
+            self.assertTrue(asyncio.run(plugin.complete_signin("private-session", "private-ciphertext"))["signed_in"])
+            asyncio.run(plugin.cancel_signin("private-session"))
+        self.assertEqual(self.logger.info.call_args_list, [
+            call("Proton VPN sign-in: secure session requested"),
+            call("Proton VPN sign-in: secure session %s", "ready"),
+            call("Proton VPN sign-in: encrypted submission received"),
+            call("Proton VPN sign-in: completion returned; outcome=%s", "signed in"),
+            call("Proton VPN sign-in: unused session cleanup requested"),
+        ])
+        self.assertNotIn("private", str(self.logger.info.call_args_list))
 
     def setUp(self):
+        logger = patch.object(main.decky, "logger", create=True)
+        self.logger = logger.start()
+        self.addCleanup(logger.stop)
+        keyring_start = patch.object(keyring, "start_service", return_value=(None, {}))
+        self.keyring_start = keyring_start.start()
+        self.addCleanup(keyring_start.stop)
         self.sessions = patch.dict(main.SIGNIN_SESSIONS, {}, clear=True)
         self.sessions.start()
         self.addCleanup(self.sessions.stop)

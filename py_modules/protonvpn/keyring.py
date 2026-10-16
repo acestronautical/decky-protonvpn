@@ -3,6 +3,8 @@ import os
 import re
 import subprocess
 import time
+from itertools import islice
+from pathlib import Path
 
 from . import proton_cli
 
@@ -11,6 +13,8 @@ BUSCTL = "/usr/bin/busctl"
 
 
 JOURNALCTL = "/usr/bin/journalctl"
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+KSECRET_SERVICE = "/usr/bin/ksecretd"
 
 
 KEYRING_PROBE_CODE = """
@@ -287,22 +291,136 @@ def startup_diagnostics(started_at: float) -> dict[str, str]:
     return {"KDE startup log": "; ".join(sorted(findings)) if findings else "no recognized failure in recent entries"}
 
 
+def steam_display_environment(proc_root: Path = Path("/proc")) -> dict[str, str]:
+    candidates = set()
+    deadline = time.monotonic() + 2
+    try:
+        with os.scandir(proc_root) as processes:
+            for index, process in enumerate(islice(processes, 4097)):
+                if index == 4096:
+                    raise RuntimeError("Steam display discovery limit reached; no keyring service was started")
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Steam display discovery timed out; no keyring service was started")
+                if not process.name.isdecimal():
+                    continue
+                directory = Path(process.path)
+                try:
+                    if directory.stat().st_uid != os.getuid():
+                        continue
+                    if (directory / "comm").read_text().strip() != "steam":
+                        continue
+                    with (directory / "environ").open("rb") as environment_file:
+                        raw = environment_file.read(131073)
+                    if len(raw) > 131072:
+                        continue
+                    environment = {}
+                    for entry in raw.split(b"\0"):
+                        name, separator, value = entry.partition(b"=")
+                        if separator and name in (b"DISPLAY", b"XAUTHORITY"):
+                            environment[name.decode("ascii")] = os.fsdecode(value)
+                    display = environment.get("DISPLAY", "")
+                    if not re.fullmatch(r":[0-9]{1,3}(?:\.[0-9]{1,2})?", display):
+                        continue
+                    display_number = display[1:].partition(".")[0]
+                    if not Path(f"/tmp/.X11-unix/X{display_number}").is_socket():
+                        continue
+                    authority = environment.get("XAUTHORITY")
+                    if authority:
+                        authority_path = Path(authority)
+                        if (
+                            not authority_path.is_absolute()
+                            or any(character in authority for character in "\0\n\r")
+                            or not authority_path.is_file()
+                            or authority_path.stat().st_uid != os.getuid()
+                        ):
+                            continue
+                    else:
+                        environment.pop("XAUTHORITY", None)
+                    candidates.add(tuple(sorted(environment.items())))
+                except (OSError, UnicodeError):
+                    continue
+            else:
+                if len(candidates) == 1:
+                    return dict(next(iter(candidates)))
+    except OSError:
+        raise RuntimeError("Steam display discovery is unavailable; no keyring service was started") from None
+    if len(candidates) > 1:
+        raise RuntimeError("Multiple Steam displays found; no keyring service was started")
+    raise RuntimeError("No usable Steam display found; open Steam in the active graphical session before starting the keyring")
+
+
+def start_kde_service(display_environment: dict[str, str]) -> None:
+    if os.getuid() == 0:
+        raise RuntimeError("Keyring activation must run as the Deck user, not root")
+    environment = proton_cli.cli_environment()
+    runtime_dir = f"/run/user/{os.getuid()}"
+    bus_address = f"unix:path={runtime_dir}/bus"
+    if environment.get("XDG_RUNTIME_DIR") != runtime_dir or environment.get("DBUS_SESSION_BUS_ADDRESS") != bus_address:
+        raise RuntimeError("Session-scoped KDE startup requires the standard user bus; no service was started")
+    unset = ["WAYLAND_DISPLAY", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "LD_LIBRARY_PATH", "LD_PRELOAD"]
+    if "XAUTHORITY" not in display_environment:
+        unset.append("XAUTHORITY")
+    command = [
+        SYSTEMD_RUN, "--user", "--collect", "--quiet",
+        "--unit=decky-protonvpn-keyring",
+        "--property=Type=dbus", "--property=BusName=org.freedesktop.secrets",
+        "--property=TimeoutStartSec=10s", "--property=TimeoutStopSec=3s",
+        "--property=Restart=no", "--property=StandardOutput=journal", "--property=StandardError=journal",
+        f"--property=UnsetEnvironment={' '.join(unset)}",
+        "--setenv=QT_QPA_PLATFORM=xcb", "--setenv=XDG_SESSION_TYPE=x11", "--setenv=LC_ALL=C",
+        f"--setenv=XDG_RUNTIME_DIR={runtime_dir}", f"--setenv=DBUS_SESSION_BUS_ADDRESS={bus_address}",
+    ]
+    command.extend(f"--setenv={name}={display_environment[name]}" for name in ("DISPLAY", "XAUTHORITY") if name in display_environment)
+    command.append(KSECRET_SERVICE)
+    try:
+        result = subprocess.run(
+            command, capture_output=True, check=False, stdin=subprocess.DEVNULL,
+            text=True, timeout=15, env=environment, start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("KDE keyring startup timed out; refresh status before retrying") from None
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        raise RuntimeError("Session-scoped KDE keyring launcher is unavailable") from None
+    if result.returncode != 0:
+        raise RuntimeError(f"KDE keyring could not start on Steam's display (exit {result.returncode}); see startup diagnostics")
+
+
 def start_service() -> tuple[str | None, dict[str, str]]:
     if os.getuid() == 0:
         raise RuntimeError("Keyring activation must run as the Deck user, not root")
     failure = None
     activation_started = None
-    startup_report = {}
+    startup_report = {"Keyring activation stage": "checking user bus"}
     try:
         names = user_bus_call("ListNames")
         if "org.freedesktop.secrets" not in names:
+            startup_report["Keyring activation stage"] = "selecting existing provider"
             service = select_service(user_bus_call("ListActivatableNames"))
             if service is None:
                 raise RuntimeError("No existing keyring provider is registered on the user bus; Desktop Mode keyring setup is required")
-            activation_started = time.time()
-            user_bus_call("StartServiceByName", service)
+            if service == "org.kde.secretservicecompat":
+                startup_report["Keyring activation stage"] = "finding Steam display"
+                display_environment = steam_display_environment()
+                startup_report["Keyring activation stage"] = "starting KDE on Steam display"
+                activation_started = time.time()
+                start_kde_service(display_environment)
+            else:
+                startup_report["Keyring activation stage"] = "requesting D-Bus activation"
+                activation_started = time.time()
+                user_bus_call("StartServiceByName", service)
+            startup_report["Keyring activation stage"] = "startup completed; checking Proton"
+        else:
+            startup_report["Keyring activation stage"] = "service already running"
     except RuntimeError as error:
         failure = str(error)
         if activation_started is not None:
-            startup_report = startup_diagnostics(activation_started)
+            startup_report.update(startup_diagnostics(activation_started))
+        else:
+            startup_report["KDE startup log"] = "not checked; activation was not attempted"
     return failure, startup_report
+
+
+def ensure_service() -> None:
+    failure = start_service()[0]
+    if failure:
+        raise RuntimeError(f"Proton VPN keyring startup failed: {failure}")

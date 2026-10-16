@@ -53,6 +53,13 @@ def _signin_result(operation, *arguments) -> dict:
         return {"error": str(error)}
 
 
+def _status_result(operation, *arguments) -> dict:
+    try:
+        return operation(*arguments)
+    except (ValueError, RuntimeError) as error:
+        return {"installed": None, "signed_in": None, "connected": None, "error": str(error)}
+
+
 def _generate_signin_keypair() -> tuple[bytearray, str]:
     private_result = subprocess.run(
         [
@@ -183,9 +190,12 @@ def _run_cli_signin(credentials: dict[str, str]) -> dict:
     ):
         raise ValueError("Enter a valid Proton username and password")
 
+    decky.logger.info("Proton VPN sign-in: preparing keyring")
+    keyring.ensure_service()
+    decky.logger.info("Proton VPN sign-in: starting CLI")
     try:
         result = subprocess.run(
-            [*proton_cli.PROTON_CLI_COMMAND, "signin", "--totp", "--", username],
+            proton_cli.cli_command(["signin", "--totp", "--", username]),
             input=f"{password}\n{totp}\n",
             capture_output=True,
             check=False,
@@ -199,6 +209,7 @@ def _run_cli_signin(credentials: dict[str, str]) -> dict:
     except (OSError, subprocess.SubprocessError, UnicodeError):
         raise RuntimeError("Proton CLI sign-in could not be started") from None
 
+    decky.logger.info("Proton VPN sign-in: CLI returned; exit=%d", result.returncode)
     output = f"{result.stdout}\n{result.stderr}".casefold()
     if result.returncode != 0:
         if "desktop app is currently running" in output or "cannot run alongside" in output:
@@ -211,10 +222,13 @@ def _run_cli_signin(credentials: dict[str, str]) -> dict:
             raise RuntimeError("Proton sign-in needs a valid authenticator or recovery code")
         if "no such option" in output and "--totp" in output:
             raise RuntimeError("Update Proton VPN in Discover or sign in from Desktop Mode")
-        raise RuntimeError("Proton CLI sign-in failed; finish sign-in in Desktop Mode")
+        category = proton_cli.command_failure_category(output)
+        raise RuntimeError(f"Proton CLI sign-in failed: {category} (exit {result.returncode})")
     status = _get_status()
     if status.get("error"):
         status["error"] = "Proton CLI completed sign-in, but verification failed. " + status["error"]
+    elif status.get("signed_in") is not True:
+        status["error"] = "Proton CLI exited without completing sign-in; no signed-in account was verified"
     return status
 
 
@@ -245,28 +259,43 @@ def _start_keyring_service() -> dict:
     except RuntimeError as error:
         return {"installed": None, "signed_in": None, "connected": None, "error": str(error)}
     result = _get_status()
+    result.setdefault("diagnostics", {}).update(startup_report)
     if failure:
         result["error"] = failure
         result.setdefault("diagnostics", {})["Service activation result"] = "failed"
-        result["diagnostics"].update(startup_report)
     elif result.get("error"):
         result.setdefault("diagnostics", {})["Service activation result"] = "request accepted; Proton verification failed"
+    decky.logger.info("Proton VPN keyring activation: %s", json.dumps(result["diagnostics"], sort_keys=True))
     return result
 
 
 def _get_status() -> dict:
+    tunnel_active = proton_cli.tunnel_active()
+    result = _get_cli_status()
+    result["tunnel_active"] = tunnel_active
+    if tunnel_active is not None and result.get("connected") is not tunnel_active:
+        result["connected"] = None
+        if tunnel_active:
+            result.setdefault("error", "A Proton VPN tunnel is active, but Proton CLI status is unavailable or inconsistent. No connection was changed.")
+        elif result.get("signed_in") is True and not result.get("error"):
+            result["error"] = "Proton CLI reports a connection, but NetworkManager has no active Proton tunnel."
+    return result
+
+
+def _get_cli_status() -> dict:
     installed = None
     signed_in = None
     try:
         installed = proton_cli.flatpak_installed()
         if not installed:
             return {"installed": False, "signed_in": False, "connected": False}
+        keyring.ensure_service()
         signed_in = proton_cli.signed_in()
         if not signed_in:
             return {
                 "installed": True,
                 "signed_in": False,
-                "connected": False,
+                "connected": None,
                 "server": "",
                 "protocol": "",
             }
@@ -299,6 +328,7 @@ def _get_countries() -> dict:
     try:
         if not proton_cli.flatpak_installed():
             return {"signed_in": False, "countries": []}
+        keyring.ensure_service()
         if not proton_cli.signed_in():
             return {"signed_in": False, "countries": []}
         return {
@@ -319,6 +349,7 @@ def _connect_country(country_code: str) -> dict:
         raise RuntimeError("Sign in to the Proton VPN CLI from Desktop Mode first")
     if country_code not in {country["code"] for country in country_data["countries"]}:
         raise ValueError("That country is not in Proton VPN's available country list")
+    keyring.ensure_service()
     proton_cli.run_cli(["connect", "--country", country_code])
     return _get_status()
 
@@ -326,6 +357,7 @@ def _connect_country(country_code: str) -> dict:
 def _disconnect() -> dict:
     if not proton_cli.flatpak_installed():
         raise RuntimeError("Proton VPN is not installed")
+    keyring.ensure_service()
     if not proton_cli.signed_in():
         raise RuntimeError("Sign in to the Proton VPN CLI from Desktop Mode first")
     proton_cli.run_cli(["disconnect"])
@@ -362,19 +394,27 @@ class Plugin:
             return {"installed": None, "signed_in": None, "connected": None, "error": str(error)}
 
     async def begin_signin(self) -> dict[str, str]:
-        return await asyncio.to_thread(_signin_result, _begin_signin)
+        decky.logger.info("Proton VPN sign-in: secure session requested")
+        result = await asyncio.to_thread(_signin_result, _begin_signin)
+        decky.logger.info("Proton VPN sign-in: secure session %s", "failed" if "error" in result else "ready")
+        return result
 
     async def complete_signin(self, session_id: str, ciphertext: str) -> dict:
-        return await asyncio.to_thread(_signin_result, _cli_operation, _complete_signin, session_id, ciphertext)
+        decky.logger.info("Proton VPN sign-in: encrypted submission received")
+        result = await asyncio.to_thread(_signin_result, _cli_operation, _complete_signin, session_id, ciphertext)
+        outcome = "error" if result.get("error") else "signed in" if result.get("signed_in") is True else "not verified"
+        decky.logger.info("Proton VPN sign-in: completion returned; outcome=%s", outcome)
+        return result
 
     async def cancel_signin(self, session_id: str) -> None:
+        decky.logger.info("Proton VPN sign-in: unused session cleanup requested")
         await asyncio.to_thread(_cancel_signin, session_id)
 
     async def get_countries(self) -> dict:
         return await asyncio.to_thread(_cli_operation, _get_countries)
 
     async def connect_country(self, country_code: str) -> dict:
-        return await asyncio.to_thread(_cli_operation, _connect_country, country_code)
+        return await asyncio.to_thread(_status_result, _cli_operation, _connect_country, country_code)
 
     async def disconnect(self) -> dict:
-        return await asyncio.to_thread(_cli_operation, _disconnect)
+        return await asyncio.to_thread(_status_result, _cli_operation, _disconnect)

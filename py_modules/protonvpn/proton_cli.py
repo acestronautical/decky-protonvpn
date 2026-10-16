@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 
 FLATPAK = "/usr/bin/flatpak"
@@ -73,6 +74,11 @@ class CLICommandError(RuntimeError):
         self.identifiers = identifiers
 
 
+def cli_command(arguments: list[str]) -> list[str]:
+    launcher = Path(__file__).with_name("cli_compat.py").read_text(encoding="utf-8")
+    return [FLATPAK, "run", "--command=python3", PROTON_APP_ID, "-c", launcher, *arguments]
+
+
 def run_cli(arguments: list[str]) -> str:
     operation = {
         "info": "account check",
@@ -82,14 +88,34 @@ def run_cli(arguments: list[str]) -> str:
         "disconnect": "disconnection",
     }.get(arguments[0] if arguments else "", "command")
     try:
+        environment = cli_environment()
+        command = cli_command(arguments)
+        if arguments and arguments[0] in ("connect", "disconnect"):
+            runtime_dir = f"/run/user/{os.getuid()}"
+            bus_address = f"unix:path={runtime_dir}/bus"
+            if os.getuid() == 0:
+                raise RuntimeError("VPN controls must run as the Deck user, not root")
+            if environment.get("XDG_RUNTIME_DIR") != runtime_dir or environment.get("DBUS_SESSION_BUS_ADDRESS") != bus_address:
+                raise RuntimeError("VPN controls require the standard user bus; no operation was started")
+            command = [
+                "/usr/bin/systemd-run", "--user", "--wait", "--pipe", "--collect", "--quiet",
+                "--unit=decky-protonvpn-network", "--expand-environment=no",
+                "--property=Type=exec", "--property=Restart=no",
+                f"--property=RuntimeMaxSec={CLI_TIMEOUT_SECONDS - 5}s",
+                "--property=TimeoutStopSec=3s", "--property=KillMode=control-group",
+                "--property=UnsetEnvironment=LD_LIBRARY_PATH LD_PRELOAD",
+                "--setenv=LC_ALL=C", f"--setenv=XDG_RUNTIME_DIR={runtime_dir}",
+                f"--setenv=DBUS_SESSION_BUS_ADDRESS={bus_address}",
+                "--", *command,
+            ]
         result = subprocess.run(
-            [*PROTON_CLI_COMMAND, *arguments],
+            command,
             capture_output=True,
             check=False,
             stdin=subprocess.DEVNULL,
             text=True,
             timeout=CLI_TIMEOUT_SECONDS,
-            env=cli_environment(),
+            env=environment,
             start_new_session=True,
         )
     except subprocess.TimeoutExpired:
@@ -141,6 +167,20 @@ def flatpak_installed() -> bool:
         category = command_failure_category(output)
         raise RuntimeError(f"Flatpak installation check failed: {category} (exit {result.returncode})")
     return PROTON_APP_ID in {line.strip() for line in result.stdout.splitlines()}
+
+
+def tunnel_active() -> bool | None:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/nmcli", "-t", "-f", "TYPE,DEVICE", "connection", "show", "--active"],
+            capture_output=True, check=False, stdin=subprocess.DEVNULL, text=True,
+            timeout=5, env=cli_environment(), start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    if result.returncode != 0:
+        return None
+    return "wireguard:proton0" in result.stdout.splitlines()
 
 
 def signed_in() -> bool:

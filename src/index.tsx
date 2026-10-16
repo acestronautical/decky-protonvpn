@@ -20,6 +20,7 @@ type ProtonStatus = {
   installed: boolean | null;
   signed_in: boolean | null;
   connected: boolean | null;
+  tunnel_active?: boolean | null;
   server?: string;
   protocol?: string;
   error?: string;
@@ -244,12 +245,14 @@ function Content() {
           <div>
             {!status
               ? "Checking Proton VPN CLI..."
-              : status.error
+              : status.tunnel_active === true && status.connected !== true
+                ? "VPN tunnel active; Proton status unavailable"
+                : status.error
                 ? "Proton VPN status is unavailable"
                 : !status.installed
                   ? "Proton VPN is not installed. Install it from Discover in Desktop Mode."
                   : !status.signed_in
-                    ? "Proton VPN CLI is signed out"
+                    ? "Proton VPN CLI is signed out; VPN state is unknown"
                     : status.connected
                       ? `Connected: ${status.server || "Proton VPN"}`
                       : "Disconnected"}
