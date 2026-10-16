@@ -240,6 +240,17 @@ class PanelSnapshotTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConnectionSnapshotTests(unittest.TestCase):
+    def test_account_status_rpc_returns_busy_without_reading_or_throwing(self):
+        with main.CLI_OPERATION_LOCK, patch.object(main, "_get_status") as status:
+            result = asyncio.run(main.Plugin().get_status())
+        self.assertTrue(result["busy"])
+        self.assertIsNone(result["signed_in"])
+        self.assertIn("in progress", result["error"])
+        status.assert_not_called()
+        with patch.object(main, "_get_status", return_value={"signed_in": False}) as status:
+            self.assertEqual(asyncio.run(main.Plugin().get_status()), {"signed_in": False})
+        status.assert_called_once_with()
+
     def test_connection_rpc_works_during_cli_operation_without_proton_or_wallet(self):
         expected = {"connected": True, "tunnel_active": True}
         with main.CLI_OPERATION_LOCK, patch.object(proton_cli, "connection_status", return_value=expected), patch.object(proton_cli, "run_cli") as cli, patch.object(proton_cli, "flatpak_installed") as installed, patch.object(keyring, "ensure_service") as wallet:

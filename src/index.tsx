@@ -73,9 +73,40 @@ const setKillSwitch = callable<[enabled: boolean], ProtonStatus>("set_kill_switc
 const setFeature = callable<[name: string, value: string], ProtonStatus>("set_feature");
 
 let detailsRequest: Promise<ProtonStatus> | undefined;
+let mutationRequest: Promise<unknown> | undefined;
+const mutationListeners = new Set<() => void>();
+
+function subscribeMutation(listener: () => void) {
+  mutationListeners.add(listener);
+  return () => { mutationListeners.delete(listener); };
+}
+
+function mutationPending() {
+  return mutationRequest !== undefined;
+}
+
+function runMutation<Result>(action: () => Promise<Result>): Promise<Result> {
+  if (mutationRequest) throw new Error("A Proton VPN operation is already in progress");
+  const precedingRead = detailsRequest;
+  const request = Promise.resolve().then(async () => {
+    if (precedingRead) await precedingRead.catch(() => {});
+    return action();
+  }).finally(() => {
+    mutationRequest = undefined;
+    for (const listener of mutationListeners) listener();
+  });
+  mutationRequest = request;
+  for (const listener of mutationListeners) listener();
+  return request;
+}
+
 function readDetails() {
   if (!detailsRequest) {
-    detailsRequest = getStatus().finally(() => { detailsRequest = undefined; });
+    const precedingMutation = mutationRequest;
+    detailsRequest = (async () => {
+      if (precedingMutation) await precedingMutation.catch(() => {});
+      return getStatus();
+    })().finally(() => { detailsRequest = undefined; });
   }
   return detailsRequest;
 }
@@ -125,13 +156,12 @@ function Content() {
   const [password, setPassword] = useState("");
   const [totp, setTotp] = useState("");
   const [error, setError] = useState<string>();
-  const [busy, setBusy] = useState(false);
+  const busy = useSyncExternalStore(subscribeMutation, mutationPending);
   const [loadingSettings, setLoadingSettings] = useState(true);
   const [signingIn, setSigningIn] = useState(false);
   const [killSwitch, setKillSwitchValue] = useState<boolean | null>(null);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
-  const actionPending = useRef(false);
   const mounted = useRef(true);
   const signInRequest = useRef<{
     plaintext: Uint8Array;
@@ -159,6 +189,7 @@ function Content() {
   useEffect(() => {
     let current = true;
     setLoadingSettings(true);
+    if (busy && activeTab !== "connection") return;
     const load = async () => {
       try {
         const result = await (activeTab === "connection" ? getConnectionStatus() : readDetails());
@@ -174,32 +205,24 @@ function Content() {
     };
     void load();
     return () => { current = false; };
-  }, [activeTab, refreshVersion]);
+  }, [activeTab, refreshVersion, busy]);
 
   const runAction = async (action: () => Promise<ProtonStatus>, success: string) => {
-    if (actionPending.current || signInRequest.current || loadingSettings) return;
-    actionPending.current = true;
-    setBusy(true);
+    if (mutationPending() || signInRequest.current || loadingSettings) return;
     setError(undefined);
     try {
-      const result = await action();
+      const result = await runMutation(action);
       if (mounted.current) applyResult(result);
       if (!result.error && result.settings?.netshield === pendingNetshield) setSelectedNetshield(undefined);
       toaster.toast({ title: "Proton VPN", body: result.error ?? result.notice ?? success });
     } catch (reason) {
       const message = String(reason);
-      setError(message);
+      if (mounted.current) setError(message);
       toaster.toast({ title: "Proton VPN", body: message });
-    } finally {
-      actionPending.current = false;
-      setBusy(false);
     }
   };
 
-  const submitSignIn = async () => {
-    if (signInRequest.current || actionPending.current || busy) {
-      return;
-    }
+  const performSignIn = async () => {
     setSigningIn(true);
     setError(undefined);
     try {
@@ -255,6 +278,11 @@ function Content() {
         setSigningIn(false);
       }
     }
+  };
+
+  const submitSignIn = async () => {
+    if (signInRequest.current || mutationPending() || loadingSettings) return;
+    await runMutation(performSignIn);
   };
 
   const selected = countries.find((country) => country.code === selectedCountry);

@@ -19,6 +19,10 @@ SIGNIN_SESSIONS: dict[str, tuple[bytearray, float]] = {}
 SIGNIN_SESSIONS_LOCK = threading.Lock()
 CLI_OPERATION_LOCK = threading.Lock()
 
+class OperationBusyError(RuntimeError):
+    pass
+
+
 def _clear_signin_sessions(expired_only: bool = False) -> None:
     with SIGNIN_SESSIONS_LOCK:
         now = time.monotonic()
@@ -39,7 +43,7 @@ def _cancel_signin(session_id: str) -> None:
 
 def _cli_operation(operation, *arguments):
     if not CLI_OPERATION_LOCK.acquire(blocking=False):
-        raise RuntimeError("A Proton VPN operation is in progress; try again shortly")
+        raise OperationBusyError("A Proton VPN operation is in progress; try again shortly")
     try:
         return operation(*arguments)
     finally:
@@ -57,7 +61,10 @@ def _status_result(operation, *arguments) -> dict:
     try:
         return operation(*arguments)
     except (ValueError, RuntimeError) as error:
-        return {"installed": None, "signed_in": None, "connected": None, "error": str(error)}
+        result = {"installed": None, "signed_in": None, "connected": None, "error": str(error)}
+        if isinstance(error, OperationBusyError):
+            result["busy"] = True
+        return result
 
 
 def _generate_signin_keypair() -> tuple[bytearray, str]:
@@ -434,7 +441,7 @@ class Plugin:
         decky.logger.info("Proton VPN Decky plugin unloaded")
 
     async def get_status(self) -> dict:
-        return await asyncio.to_thread(_cli_operation, _get_status)
+        return await asyncio.to_thread(_status_result, _cli_operation, _get_status)
 
     async def start_keyring(self) -> dict:
         try:
