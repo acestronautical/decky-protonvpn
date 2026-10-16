@@ -50,16 +50,17 @@ package_plugin() {
   local archive="$output_dir/decky-protonvpn-dev.zip"
   local staging_dir
   staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/decky-protonvpn.XXXXXX")"
+  local plugin_dir="$staging_dir/Proton VPN (Unofficial)"
 
-  mkdir -p "$output_dir" "$staging_dir/Proton VPN/dist"
+  mkdir -p "$output_dir" "$plugin_dir/dist"
   cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/main.py" "$ROOT_DIR/package.json" \
-    "$ROOT_DIR/plugin.json" "$ROOT_DIR/README.md" "$staging_dir/Proton VPN/"
-  mkdir -p "$staging_dir/Proton VPN/py_modules/protonvpn"
-  cp "$ROOT_DIR"/py_modules/protonvpn/*.py "$staging_dir/Proton VPN/py_modules/protonvpn/"
-  cp "$ROOT_DIR"/py_modules/protonvpn/countries.json "$staging_dir/Proton VPN/py_modules/protonvpn/"
-  cp -a "$ROOT_DIR/dist/." "$staging_dir/Proton VPN/dist/"
+    "$ROOT_DIR/plugin.json" "$ROOT_DIR/README.md" "$ROOT_DIR/NOTICE.md" "$plugin_dir/"
+  mkdir -p "$plugin_dir/py_modules/protonvpn"
+  cp "$ROOT_DIR"/py_modules/protonvpn/*.py "$plugin_dir/py_modules/protonvpn/"
+  cp "$ROOT_DIR"/py_modules/protonvpn/countries.json "$plugin_dir/py_modules/protonvpn/"
+  cp -a "$ROOT_DIR/dist/." "$plugin_dir/dist/"
   rm -f "$archive"
-  (cd "$staging_dir" && zip -qr "$archive" "Proton VPN")
+  (cd "$staging_dir" && zip -qr "$archive" "Proton VPN (Unofficial)")
   rm -rf -- "$staging_dir"
   printf 'Created %s\n' "$archive"
 }

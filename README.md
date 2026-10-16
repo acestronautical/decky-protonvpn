@@ -1,6 +1,14 @@
-# Proton VPN for Decky
+# Proton VPN for Decky (Unofficial)
 
-A Decky Quick Access plugin for viewing and toggling Proton VPN connections created by Proton VPN for Linux.
+An independent, unofficial Decky Quick Access integration for viewing and controlling connections created by Proton VPN for Linux. This project is not affiliated with, sponsored by, or endorsed by Proton AG. Proton VPN is a trademark of Proton AG; the name identifies the service this plugin works with.
+
+## License and Attribution
+
+The plugin's software is licensed under [BSD-3-Clause](LICENSE), a permissive open-source license allowing use, modification, commercial use, and redistribution subject to its notice and non-endorsement conditions. Existing Steam Deck Homebrew attribution is retained. Third-party software and artwork retain their respective rights and licenses; no trademark rights are granted. See [NOTICE.md](NOTICE.md).
+
+## Prerelease Installation
+
+Download the installable ZIP from [GitHub Releases](https://github.com/acestronautical/decky-protonvpn/releases), not GitHub's automatically generated source archives. In Decky settings, use **Manual Plugin Install > Load from ZIP file**. If an earlier development build named **Proton VPN** is installed, remove that plugin first to avoid running two copies, then install **Proton VPN (Unofficial)**. Do not uninstall the Proton VPN Flatpak or delete its account data.
 
 ## Status
 

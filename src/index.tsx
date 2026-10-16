@@ -561,8 +561,8 @@ function Content() {
 }
 
 export default definePlugin(() => ({
-  name: "Proton VPN",
-  titleView: <div className={staticClasses.Title}>Proton VPN</div>,
+  name: "Proton VPN (Unofficial)",
+  titleView: <div className={staticClasses.Title} style={{ fontSize: 16 }}>Proton VPN (Unofficial)</div>,
   content: <Content />,
   icon: <ProtonIcon />,
 }));

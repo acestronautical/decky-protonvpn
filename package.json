@@ -1,7 +1,7 @@
 {
   "name": "decky-protonvpn",
   "version": "0.1.0",
-  "description": "Control Proton VPN connections from Steam Deck Gaming Mode",
+  "description": "Unofficial Decky integration for Proton VPN; not affiliated with Proton AG",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
@@ -10,7 +10,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/acestronautical/deck-protonvpn.git"
+    "url": "git+https://github.com/acestronautical/decky-protonvpn.git"
   },
   "keywords": [
     "decky",
@@ -23,9 +23,9 @@
   "author": "acestronautical",
   "license": "BSD-3-Clause",
   "bugs": {
-    "url": "https://github.com/acestronautical/deck-protonvpn/issues"
+    "url": "https://github.com/acestronautical/decky-protonvpn/issues"
   },
-  "homepage": "https://github.com/acestronautical/deck-protonvpn#readme",
+  "homepage": "https://github.com/acestronautical/decky-protonvpn#readme",
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
     "@decky/ui": "^4.11.0",

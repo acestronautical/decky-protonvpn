@@ -1,10 +1,10 @@
 {
-  "name": "Proton VPN",
+  "name": "Proton VPN (Unofficial)",
   "author": "acestronautical",
   "flags": [],
   "api_version": 1,
   "publish": {
     "tags": ["vpn", "protonvpn", "utility"],
-    "description": "Check and toggle Proton VPN connections from Gaming Mode."
+    "description": "Unofficial Decky integration for Proton VPN. Not affiliated with or endorsed by Proton AG."
   }
 }
