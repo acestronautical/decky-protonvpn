@@ -12,12 +12,13 @@ const compiled = ts.transpileModule(readFileSync(new URL("../src/index.tsx", imp
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true },
 }).outputText;
 
-function panelHarness({ detailsGate, actionGate, cachedName = "" } = {}) {
+function panelHarness({ detailsGate, actionGate, cachedName = "", installError, existingInstall = false, pollError = false } = {}) {
   const calls = [];
   const modals = [];
   let killSwitch = false;
   let settings = { "kill-switch": "off", netshield: "off", "vpn-accelerator": "on", "moderate-nat": "off" };
   let status = { installed: true, signed_in: true, connected: true, tunnel_active: true };
+  let installation = existingInstall ? { state: "running", stage: "installing" } : { state: "idle" };
   const controls = Object.fromEntries([
     "ConfirmModal", "DialogButton", "DropdownItem", "Focusable", "PanelSection", "PanelSectionRow", "TextField", "ToggleField",
   ].map(name => [name, name]));
@@ -33,7 +34,18 @@ function panelHarness({ detailsGate, actionGate, cachedName = "" } = {}) {
       toaster: { toast: () => {} },
       callable: name => async (...args) => {
         calls.push([name, ...args]);
-        assert.ok(["get_connection_status", "get_status", "connect_country", "disconnect", "quick_connect", "signout", "set_kill_switch", "set_feature", "begin_signin", "complete_signin", "cancel_signin"].includes(name), `Unexpected RPC ${name}`);
+        assert.ok(["get_connection_status", "get_status", "connect_country", "disconnect", "quick_connect", "signout", "set_kill_switch", "set_feature", "begin_signin", "complete_signin", "cancel_signin", "install_proton", "get_installation_status"].includes(name), `Unexpected RPC ${name}`);
+        if (name === "install_proton") {
+          installation = { state: "running", stage: "installing" };
+          return installation;
+        }
+        if (name === "get_installation_status") {
+          if (pollError) throw new Error("RPC unavailable");
+          if (actionGate) await actionGate;
+          installation = installError ? { state: "failed", error: installError } : { state: "succeeded" };
+          status = { ...status, installed: !installError, signed_in: false };
+          return installation;
+        }
         if (name === "begin_signin") return { session_id: "test-session", public_key: "test-key" };
         if (name === "cancel_signin") return;
         if (name === "complete_signin") {
@@ -51,11 +63,11 @@ function panelHarness({ detailsGate, actionGate, cachedName = "" } = {}) {
           settings["kill-switch"] = killSwitch ? "standard" : "off";
         }
         if (name === "set_feature") settings[args[0]] = args[1];
-        return { ...status, kill_switch: killSwitch, settings: { ...settings } };
+        return { ...status, installation, kill_switch: killSwitch, settings: { ...settings } };
       },
     },
     "react-icons/fa": Object.fromEntries([
-      "FaBolt", "FaExchangeAlt", "FaPowerOff", "FaSignOutAlt", "FaSlidersH", "FaSyncAlt", "FaUser",
+      "FaBolt", "FaDownload", "FaExchangeAlt", "FaPowerOff", "FaSignOutAlt", "FaSlidersH", "FaSyncAlt", "FaUser",
     ].map(name => [name, () => null])),
     "./signin": { cachedUsername: () => cachedName, rememberUsername: () => {}, encodeSignIn: () => new Uint8Array(3), encryptSignIn: async () => "test-ciphertext" },
     "../protonvpn-dark.png": "protonvpn.png",
@@ -63,6 +75,7 @@ function panelHarness({ detailsGate, actionGate, cachedName = "" } = {}) {
   };
   const module = { exports: {} };
   runInNewContext(compiled, {
+    setTimeout: callback => queueMicrotask(callback),
     crypto: { subtle: {} },
     exports: module.exports,
     module,
@@ -220,6 +233,73 @@ test("Account shows verified identity, clears it on sign-out, and never substitu
   await panel.tab("connection");
   await panel.tab("account");
   assert.equal(panel.frame().findByProps({ "aria-label": "Signed-in account" }).children.join(""), "Account name unavailable");
+  panel.close();
+});
+
+test("missing Proton offers a confirmed install that survives remount without duplication", async () => {
+  let release;
+  const actionGate = new Promise(resolve => { release = resolve; });
+  const panel = panelHarness({ actionGate });
+  panel.setStatus({ installed: false, signed_in: false, connected: false, tunnel_active: false });
+  await panel.open();
+  assert.deepEqual(panel.calls, [["get_connection_status"]]);
+  await panel.tab("account");
+  assert.ok(panel.button("Install Proton VPN"));
+  assert.equal(panel.button("Sign in"), undefined);
+  act(() => panel.button("Install Proton VPN").props.onClick());
+  assert.equal(panel.calls.filter(call => call[0] === "install_proton").length, 0);
+  const confirm = panel.modals[0].props.onOK;
+  await act(async () => confirm());
+  panel.close();
+  await panel.open();
+  assert.equal(panel.frame().findByProps({ role: "status" }).children.join(""), "Installing Proton VPN...");
+  await act(async () => confirm());
+  assert.equal(panel.calls.filter(call => call[0] === "install_proton").length, 1);
+  await act(async () => release());
+  assert.ok(panel.button("Sign in"));
+  assert.equal(panel.button("Install Proton VPN"), undefined);
+  panel.close();
+});
+
+test("Account resumes an existing backend installation without starting another", async () => {
+  let release;
+  const actionGate = new Promise(resolve => { release = resolve; });
+  const panel = panelHarness({ actionGate, existingInstall: true });
+  panel.setStatus({ installed: false, signed_in: false, connected: false, tunnel_active: false });
+  await panel.open();
+  await panel.tab("account");
+  assert.equal(panel.calls.filter(call => call[0] === "install_proton").length, 0);
+  assert.equal(panel.frame().findByProps({ role: "status" }).children.join(""), "Installing Proton VPN...");
+  await act(async () => release());
+  assert.ok(panel.button("Sign in"));
+  panel.close();
+});
+
+test("failed installation permits an explicit retry and does not expose sign-in", async () => {
+  const panel = panelHarness({ installError: "Installation failed" });
+  panel.setStatus({ installed: false, signed_in: false, connected: false, tunnel_active: false });
+  await panel.open();
+  await panel.tab("account");
+  act(() => panel.button("Install Proton VPN").props.onClick());
+  await act(async () => panel.modals[0].props.onOK());
+  assert.equal(panel.calls.filter(call => call[0] === "install_proton").length, 1);
+  assert.equal(panel.button("Install Proton VPN").props.disabled, false);
+  assert.equal(panel.button("Sign in"), undefined);
+  assert.equal(panel.frame().findByProps({ role: "alert" }).children.join(""), "Installation failed");
+  panel.close();
+});
+
+test("unavailable install status allows a status retry without another install", async () => {
+  const panel = panelHarness({ pollError: true });
+  panel.setStatus({ installed: false, signed_in: false, connected: false, tunnel_active: false });
+  await panel.open();
+  await panel.tab("account");
+  act(() => panel.button("Install Proton VPN").props.onClick());
+  await act(async () => panel.modals[0].props.onOK());
+  assert.equal(panel.button("Retry").props.disabled, false);
+  assert.equal(panel.button("Install Proton VPN").props.disabled, true);
+  await act(async () => panel.button("Retry").props.onClick());
+  assert.equal(panel.calls.filter(call => call[0] === "install_proton").length, 1);
   panel.close();
 });
 

@@ -13,7 +13,7 @@ import {
 } from "@decky/ui";
 import { callable, definePlugin, toaster } from "@decky/api";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { FaBolt, FaExchangeAlt, FaPowerOff, FaSignOutAlt, FaSlidersH, FaSyncAlt, FaUser } from "react-icons/fa";
+import { FaBolt, FaDownload, FaExchangeAlt, FaPowerOff, FaSignOutAlt, FaSlidersH, FaSyncAlt, FaUser } from "react-icons/fa";
 import { cachedUsername, encodeSignIn, encryptSignIn, rememberUsername } from "./signin";
 import protonIcon from "../protonvpn-dark.png";
 import countryNames from "../py_modules/protonvpn/countries.json";
@@ -23,7 +23,14 @@ type ProtonCountry = {
   name: string;
 };
 
+type InstallationStatus = {
+  state: "idle" | "running" | "succeeded" | "failed" | "blocked" | "unknown";
+  stage?: string;
+  error?: string;
+};
+
 type ProtonStatus = {
+  installation?: InstallationStatus;
   installed: boolean | null;
   signed_in: boolean | null;
   account_name?: string | null;
@@ -70,12 +77,37 @@ const connectCountry = callable<[countryCode: string], ProtonStatus>(
 const disconnect = callable<[], ProtonStatus>("disconnect");
 const quickConnect = callable<[], ProtonStatus>("quick_connect");
 const signOut = callable<[], ProtonStatus>("signout");
+const installProton = callable<[], InstallationStatus>("install_proton");
+const getInstallationStatus = callable<[], InstallationStatus>("get_installation_status");
 const setKillSwitch = callable<[enabled: boolean], ProtonStatus>("set_kill_switch");
 const setFeature = callable<[name: string, value: string], ProtonStatus>("set_feature");
 
 let detailsRequest: Promise<ProtonStatus> | undefined;
 let mutationRequest: Promise<unknown> | undefined;
 const mutationListeners = new Set<() => void>();
+let installationState: InstallationStatus = { state: "idle" };
+
+function getInstallationState() {
+  return installationState;
+}
+
+async function waitForInstallation(job: InstallationStatus) {
+  installationState = job;
+  for (const listener of mutationListeners) listener();
+  while (job.state === "running") {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    try {
+      job = await getInstallationStatus();
+    } catch {
+      installationState = { state: "unknown" };
+      for (const listener of mutationListeners) listener();
+      throw new Error("Installation status is unavailable; refresh Account before retrying");
+    }
+    installationState = job;
+    for (const listener of mutationListeners) listener();
+  }
+  return job;
+}
 
 function subscribeMutation(listener: () => void) {
   mutationListeners.add(listener);
@@ -106,7 +138,13 @@ function readDetails() {
     const precedingMutation = mutationRequest;
     detailsRequest = (async () => {
       if (precedingMutation) await precedingMutation.catch(() => {});
-      return getStatus();
+      let result = await getStatus();
+      if (result.installation) {
+        const job = await waitForInstallation(result.installation);
+        if (result.installation.state === "running") result = await getStatus();
+        if (job.error && result.installed !== true) result = { ...result, error: result.error ?? job.error };
+      }
+      return result;
     })().finally(() => { detailsRequest = undefined; });
   }
   return detailsRequest;
@@ -158,6 +196,7 @@ function Content() {
   const [totp, setTotp] = useState("");
   const [error, setError] = useState<string>();
   const busy = useSyncExternalStore(subscribeMutation, mutationPending);
+  const installation = useSyncExternalStore(subscribeMutation, getInstallationState);
   const [loadingSettings, setLoadingSettings] = useState(true);
   const [signingIn, setSigningIn] = useState(false);
   const [killSwitch, setKillSwitchValue] = useState<boolean | null>(null);
@@ -287,7 +326,7 @@ function Content() {
   };
 
   const selected = countries.find((country) => country.code === selectedCountry);
-  const blocked = busy || signingIn || loadingSettings;
+  const blocked = busy || signingIn || loadingSettings || installation.state === "running";
   const active = status?.tunnel_active === true || status?.connected === true;
   const canChangeKillSwitch = status?.connected === false && status?.tunnel_active === false;
   const connectionAction = selectedCountry ? () => connectCountry(selectedCountry) : quickConnect;
@@ -299,6 +338,19 @@ function Content() {
       strCancelButtonText="Cancel"
       bDestructiveWarning
       onOK={() => void runAction(signOut, "Signed out")}
+    />,
+  );
+  const confirmInstall = () => showModal(
+    <ConfirmModal
+      strTitle="Install Proton VPN?"
+      strDescription="Download Proton VPN and its required runtimes from Flathub for this user. The official user Flathub repository will be added if missing. This may use substantial disk space and take several minutes."
+      strOKButtonText="Install"
+      strCancelButtonText="Cancel"
+      onOK={() => void runAction(async () => {
+        const job = await waitForInstallation(await installProton());
+        const result = await getStatus();
+        return { ...result, error: job.error ?? result.error };
+      }, "Proton VPN installed")}
     />,
   );
   const changeKillSwitch = (enabled: boolean) => {
@@ -430,8 +482,13 @@ function Content() {
   </>;
 
   const accountView = <>
-    {loadingSettings && <PanelSection><PanelSectionRow>Checking account...</PanelSectionRow></PanelSection>}
-    {status?.installed === false && <PanelSection><PanelSectionRow>Install Proton VPN from Discover in Desktop Mode.</PanelSectionRow></PanelSection>}
+    {loadingSettings && installation.state !== "running" && <PanelSection><PanelSectionRow>Checking account...</PanelSectionRow></PanelSection>}
+    {installation.state === "running" && <PanelSection><PanelSectionRow>
+      <div role="status">{({ checking: "Checking installation...", repository: "Preparing Flathub...", installing: "Installing Proton VPN...", verifying: "Verifying Proton VPN..." } as Record<string, string>)[installation.stage ?? ""] ?? "Installing Proton VPN..."}</div>
+    </PanelSectionRow></PanelSection>}
+    {status?.installed === false && <PanelSection><PanelSectionRow>
+      <DialogButton style={actionStyle} disabled={blocked || installation.state === "unknown"} onClick={confirmInstall}><FaDownload /> Install Proton VPN</DialogButton>
+    </PanelSectionRow></PanelSection>}
     {status?.signed_in && <PanelSection title="Account">
       <PanelSectionRow>
         <div aria-label="Signed-in account" style={{ fontSize: 14, overflowWrap: "anywhere", minWidth: 0, paddingBottom: 8 }}>

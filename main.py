@@ -18,6 +18,62 @@ SIGNIN_SESSION_TTL_SECONDS = 300
 SIGNIN_SESSIONS: dict[str, tuple[bytearray, float]] = {}
 SIGNIN_SESSIONS_LOCK = threading.Lock()
 CLI_OPERATION_LOCK = threading.Lock()
+INSTALL_JOB_LOCK = threading.Lock()
+INSTALL_JOB: dict = {"state": "idle"}
+
+
+def _installation_status() -> dict:
+    with INSTALL_JOB_LOCK:
+        return dict(INSTALL_JOB)
+
+
+def _installation_progress(stage: str) -> None:
+    with INSTALL_JOB_LOCK:
+        INSTALL_JOB.update(stage=stage)
+
+
+def _run_installation() -> None:
+    outcome = {"state": "failed", "error": "Proton VPN installation could not complete"}
+    try:
+        proton_cli.install_flatpak(_installation_progress)
+        _installation_progress("verifying")
+        result = _get_status()
+        if result.get("installed") is not True or result.get("error") or result.get("signed_in") is None:
+            raise RuntimeError(result.get("error") or "Proton VPN was installed but its CLI could not be verified")
+        outcome = {"state": "succeeded", "stage": "complete"}
+    except RuntimeError as error:
+        outcome = {"state": "failed", "error": str(error)}
+    except Exception:
+        pass
+    finally:
+        with INSTALL_JOB_LOCK:
+            CLI_OPERATION_LOCK.release()
+            INSTALL_JOB.update(outcome)
+
+
+def _start_installation() -> dict:
+    with INSTALL_JOB_LOCK:
+        if INSTALL_JOB["state"] == "running":
+            return dict(INSTALL_JOB)
+        if not CLI_OPERATION_LOCK.acquire(blocking=False):
+            return {"state": "blocked", "error": "A Proton VPN operation is in progress; try again shortly"}
+        INSTALL_JOB.clear()
+        INSTALL_JOB.update(state="running", stage="checking")
+        try:
+            threading.Thread(target=_run_installation, daemon=True).start()
+        except Exception:
+            CLI_OPERATION_LOCK.release()
+            INSTALL_JOB.update(state="failed", error="Proton VPN installation could not start")
+        return dict(INSTALL_JOB)
+
+
+def _status_with_installation() -> dict:
+    installation = _installation_status()
+    if installation["state"] == "running":
+        return {"installed": None, "signed_in": None, "connected": None, "installation": installation}
+    result = _status_result(_cli_operation, _get_status)
+    result["installation"] = _installation_status()
+    return result
 
 class OperationBusyError(RuntimeError):
     pass
@@ -441,7 +497,13 @@ class Plugin:
         decky.logger.info("Proton VPN Decky plugin unloaded")
 
     async def get_status(self) -> dict:
-        return await asyncio.to_thread(_status_result, _cli_operation, _get_status)
+        return await asyncio.to_thread(_status_with_installation)
+
+    async def install_proton(self) -> dict:
+        return _start_installation()
+
+    async def get_installation_status(self) -> dict:
+        return _installation_status()
 
     async def start_keyring(self) -> dict:
         try:

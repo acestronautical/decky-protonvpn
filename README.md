@@ -9,11 +9,21 @@ Backend integration checks were performed on a Steam Deck running SteamOS 3.8.28
 ## Requirements
 
 - Steam Deck with Decky Loader installed
-- Proton VPN installed from Discover in Desktop Mode
+- Proton VPN Flatpak, installed through the plugin's Account tab or Discover in Desktop Mode
 - A current Proton VPN Flatpak CLI with `signin --totp` support
 - For Gaming Mode sign-in: Web Crypto in Steam's browser, `/usr/bin/openssl`, and writable `/dev/shm` on SteamOS
 
-The Proton VPN Flatpak includes the official Linux CLI. The plugin does not install Proton VPN. Install or update the Flatpak from Discover, then close its GUI before using the plugin; Proton does not support running the GUI and CLI concurrently.
+The Proton VPN Flatpak includes the official Linux CLI. Close its GUI before using the plugin; Proton does not support running the GUI and CLI concurrently. Existing installations can be updated through Discover.
+
+## Install Proton VPN
+
+If Proton VPN is missing, open **Account > Install Proton VPN** and confirm. The plugin installs only `com.protonvpn.www` from the stable Flathub branch for the current user, including required runtimes. It adds the official user Flathub repository if absent; an unexpected repository URL or disabled signature verification is rejected rather than overwritten. Root access and policy changes are not used. Existing user or system installations are not duplicated or automatically updated.
+
+Installation shows checking, repository, downloading/installing, and verification stages. Closing and reopening the panel does not stop or restart the backend job. Keep the Deck awake and avoid restarting Decky during installation; progress is not persisted across backend restarts. Downloads have a 30-minute timeout. Failures require an explicit retry, and a lost status response must be checked again before another install can be requested.
+
+After installation, the plugin verifies the installed app and runs its existing guarded account/CLI check before offering sign-in. Unsupported Proton implementations are not bypassed. Connection-only viewing still performs no Flatpak or Proton checks. Discover remains the manual installation fallback.
+
+The user-scoped companion-app installation approach has prior art in [Decky Prism](https://github.com/shadeov/decky-prism); installation and failure handling here are tested with mocked Flatpak operations, not a live uninstall/reinstall cycle.
 
 ## Sign In
 

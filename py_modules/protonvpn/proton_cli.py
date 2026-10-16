@@ -224,6 +224,51 @@ def flatpak_installed() -> bool:
     return PROTON_APP_ID in {line.strip() for line in result.stdout.splitlines()}
 
 
+def install_flatpak(report_progress) -> None:
+    if os.getuid() == 0:
+        raise RuntimeError("Install Proton VPN as the Deck user, not root")
+    report_progress("checking")
+    if flatpak_installed():
+        return
+
+    def command(arguments: list[str], timeout: int = 60) -> str:
+        try:
+            result = subprocess.run(
+                [FLATPAK, *arguments], capture_output=True, check=False,
+                stdin=subprocess.DEVNULL, text=True, timeout=timeout,
+                env=cli_environment(), start_new_session=True,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Flatpak installation timed out; check installation status before retrying") from None
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            raise RuntimeError("Flatpak installation could not run") from None
+        if result.returncode != 0:
+            raise RuntimeError(f"Flatpak installation failed (exit {result.returncode}); check connectivity and free disk space")
+        return result.stdout
+
+    def trusted_remote() -> bool:
+        output = command(["remotes", "--user", "--columns=name,url,options"])
+        for line in output.splitlines():
+            fields = line.split("\t")
+            if fields[0] != "flathub":
+                continue
+            if len(fields) < 2 or fields[1] not in ("https://dl.flathub.org/repo/", "https://flathub.org/repo/") or any("no-gpg-verify" in field for field in fields[2:]):
+                raise RuntimeError("The user Flathub repository is not trusted; check it in Desktop Mode")
+            return True
+        return False
+
+    report_progress("repository")
+    if not trusted_remote():
+        command(["remote-add", "--user", "--if-not-exists", "flathub", "https://dl.flathub.org/repo/flathub.flatpakrepo"])
+        if not trusted_remote():
+            raise RuntimeError("The user Flathub repository could not be verified")
+    report_progress("installing")
+    command(["install", "--user", "--noninteractive", "--assumeyes", "flathub", f"{PROTON_APP_ID}//stable"], timeout=1800)
+    report_progress("verifying")
+    if not flatpak_installed():
+        raise RuntimeError("Flatpak finished but Proton VPN installation could not be verified")
+
+
 def tunnel_active() -> bool | None:
     try:
         result = subprocess.run(

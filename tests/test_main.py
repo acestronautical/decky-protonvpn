@@ -196,6 +196,134 @@ class ReliabilityTests(unittest.TestCase):
             self.assertIsNone(proton_cli.tunnel_active())
 
 
+class InstallationJobTests(unittest.TestCase):
+    def setUp(self):
+        self.job = patch.object(main, "INSTALL_JOB", {"state": "idle"})
+        self.job.start()
+        self.addCleanup(self.job.stop)
+
+    def test_duplicate_requests_share_one_job_and_status_does_not_run_cli(self):
+        with patch.object(main.threading, "Thread") as thread, patch.object(main, "_get_status") as status:
+            first = asyncio.run(main.Plugin().install_proton())
+            try:
+                second = asyncio.run(main.Plugin().install_proton())
+                snapshot = main._status_with_installation()
+                self.assertEqual(first, second)
+                self.assertEqual(snapshot["installation"]["state"], "running")
+                thread.assert_called_once()
+                status.assert_not_called()
+            finally:
+                main.CLI_OPERATION_LOCK.release()
+
+    def test_busy_operation_prevents_job_start(self):
+        with main.CLI_OPERATION_LOCK, patch.object(main.threading, "Thread") as thread:
+            self.assertEqual(main._start_installation()["state"], "blocked")
+        thread.assert_not_called()
+
+    def test_worker_verifies_cli_and_releases_lock_on_success_and_failure(self):
+        for result, state in (({"installed": True, "signed_in": False}, "succeeded"), ({"installed": True, "signed_in": None, "error": "Unsupported Proton keyring implementation"}, "failed")):
+            with self.subTest(state=state), patch.object(proton_cli, "install_flatpak") as install, patch.object(main, "_get_status", return_value=result) as status:
+                main.INSTALL_JOB.update(state="running")
+                main.CLI_OPERATION_LOCK.acquire()
+                main._run_installation()
+                self.assertEqual(main._installation_status()["state"], state)
+                self.assertFalse(main.CLI_OPERATION_LOCK.locked())
+                install.assert_called_once()
+                status.assert_called_once()
+
+    def test_worker_failure_is_not_retried_or_followed_by_cli_read(self):
+        with patch.object(proton_cli, "install_flatpak", side_effect=RuntimeError("Installation failed")) as install, patch.object(main, "_get_status") as status:
+            main.CLI_OPERATION_LOCK.acquire()
+            main._run_installation()
+        self.assertEqual(main._installation_status()["error"], "Installation failed")
+        self.assertFalse(main.CLI_OPERATION_LOCK.locked())
+        install.assert_called_once()
+        status.assert_not_called()
+
+    def test_real_worker_keeps_one_job_and_publishes_completion_after_unlock(self):
+        entered = main.threading.Event()
+        release = main.threading.Event()
+        real_thread = main.threading.Thread
+        workers = []
+
+        def create_thread(**arguments):
+            worker = real_thread(**arguments)
+            workers.append(worker)
+            return worker
+
+        def install(progress):
+            progress("installing")
+            entered.set()
+            if not release.wait(2):
+                raise RuntimeError("Test gate timed out")
+
+        with patch.object(main.threading, "Thread", side_effect=create_thread), patch.object(proton_cli, "install_flatpak", side_effect=install) as installer, patch.object(main, "_get_status", return_value={"installed": True, "signed_in": False}):
+            try:
+                self.assertEqual(main._start_installation()["state"], "running")
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(main._start_installation()["stage"], "installing")
+                self.assertEqual(main._status_with_installation()["installation"]["state"], "running")
+            finally:
+                release.set()
+                for worker in workers:
+                    worker.join(3)
+            self.assertEqual(len(workers), 1)
+            self.assertFalse(workers[0].is_alive())
+            self.assertEqual(main._installation_status()["state"], "succeeded")
+            self.assertFalse(main.CLI_OPERATION_LOCK.locked())
+            installer.assert_called_once()
+
+
+class FlatpakInstallTests(unittest.TestCase):
+    def test_existing_trusted_remote_is_reused_and_success_is_verified(self):
+        remote = "flathub\thttps://dl.flathub.org/repo/\t\n"
+        with patch.object(os, "getuid", return_value=1000), patch.object(proton_cli, "flatpak_installed", side_effect=[False, False]), patch.object(subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, output, "") for output in (remote, "")]) as run:
+            with self.assertRaisesRegex(RuntimeError, "could not be verified"):
+                proton_cli.install_flatpak(Mock())
+        self.assertEqual([call.args[0][1] for call in run.call_args_list], ["remotes", "install"])
+
+    def test_user_install_adds_only_official_remote_and_verifies_installation(self):
+        remote = "flathub\thttps://dl.flathub.org/repo/\t\n"
+        replies = ["", "", remote, ""]
+        with patch.object(os, "getuid", return_value=1000), patch.object(proton_cli, "flatpak_installed", side_effect=[False, True]), patch.object(subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, output, "") for output in replies]) as run:
+            progress = Mock()
+            proton_cli.install_flatpak(progress)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[-1], [proton_cli.FLATPAK, "install", "--user", "--noninteractive", "--assumeyes", "flathub", "com.protonvpn.www//stable"])
+        self.assertIn("https://dl.flathub.org/repo/flathub.flatpakrepo", commands[1])
+        self.assertEqual(run.call_args_list[-1].kwargs["timeout"], 1800)
+        for call in run.call_args_list:
+            self.assertIn("--user", call.args[0])
+            self.assertEqual(call.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual([call.args[0] for call in progress.call_args_list], ["checking", "repository", "installing", "verifying"])
+
+    def test_existing_installation_is_never_updated_or_duplicated(self):
+        with patch.object(os, "getuid", return_value=1000), patch.object(proton_cli, "flatpak_installed", return_value=True), patch.object(subprocess, "run") as run:
+            proton_cli.install_flatpak(Mock())
+        run.assert_not_called()
+
+    def test_root_is_rejected_before_any_flatpak_operation(self):
+        with patch.object(os, "getuid", return_value=0), patch.object(proton_cli, "flatpak_installed") as installed:
+            with self.assertRaisesRegex(RuntimeError, "not root"):
+                proton_cli.install_flatpak(Mock())
+        installed.assert_not_called()
+
+    def test_untrusted_remote_is_not_replaced_or_used(self):
+        for remote in ("flathub\thttps://example.com/repo/\t\n", "flathub\thttps://dl.flathub.org/repo/\tno-gpg-verify\n"):
+            with self.subTest(remote=remote), patch.object(os, "getuid", return_value=1000), patch.object(proton_cli, "flatpak_installed", return_value=False), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, remote, "")) as run:
+                with self.assertRaisesRegex(RuntimeError, "not trusted"):
+                    proton_cli.install_flatpak(Mock())
+            self.assertEqual(run.call_count, 1)
+
+    def test_failure_and_timeout_are_sanitized_and_not_retried(self):
+        for failure in (subprocess.CompletedProcess([], 1, "private-data", "private-data"), subprocess.TimeoutExpired("private-data", 60)):
+            with self.subTest(failure=type(failure).__name__), patch.object(os, "getuid", return_value=1000), patch.object(proton_cli, "flatpak_installed", return_value=False), patch.object(subprocess, "run", side_effect=[failure]) as run:
+                with self.assertRaises(RuntimeError) as raised:
+                    proton_cli.install_flatpak(Mock())
+            self.assertNotIn("private-data", str(raised.exception))
+            self.assertEqual(run.call_count, 1)
+
+
 class PanelSnapshotTests(unittest.IsolatedAsyncioTestCase):
     async def test_snapshot_reads_metadata_and_settings_without_server_lookup(self):
         controller = Mock(is_logged_in=True, user_on_free_tier=False, account_name="verified-user")
@@ -295,7 +423,7 @@ class ConnectionSnapshotTests(unittest.TestCase):
         self.assertIn("in progress", result["error"])
         status.assert_not_called()
         with patch.object(main, "_get_status", return_value={"signed_in": False}) as status:
-            self.assertEqual(asyncio.run(main.Plugin().get_status()), {"signed_in": False})
+            self.assertFalse(asyncio.run(main.Plugin().get_status())["signed_in"])
         status.assert_called_once_with()
 
     def test_connection_rpc_works_during_cli_operation_without_proton_or_wallet(self):
